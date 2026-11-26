@@ -273,7 +273,11 @@ it see-through.
 
 The picture is drawn with OpenGL, which needs a display. On a Linux server
 or in CI without one, run the script under a virtual X server, such as
-``xvfb-run python my_model.py``. On macOS, call it from the main thread.
+``xvfb-run python my_model.py``. When several processes draw at once on one
+virtual X server, such as parallel test workers, start it with ``-noreset``,
+as in ``xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" pytest -n auto``;
+otherwise it resets whenever its last client disconnects, and a process
+connecting at that moment fails. On macOS, call it from the main thread.
 
 *********************
 Make a 2D drawing
