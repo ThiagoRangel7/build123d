@@ -27,6 +27,8 @@ pass the builder's result: ``export_step(my_part.part, "part.step")``.
       - ``export_stl``, or ``Mesher`` for 3MF
     * - show a model on the web or in a renderer
       - ``export_gltf``, ``export_obj``
+    * - make a picture of a model
+      - ``export_png``
     * - make a 2D drawing
       - ``ExportSVG``, ``ExportDXF``
     * - bring in a mesh
@@ -87,6 +89,12 @@ Choose a format
       - no
       - no
       - :func:`~exporters3d.export_obj` (export only)
+    * - PNG
+      - a shaded picture
+      - yes
+      - no
+      - no
+      - :func:`~exporters3d.export_png` (export only)
     * - SVG
       - 2D lines and filled shapes
       - yes
@@ -244,6 +252,28 @@ The OBJ exporter writes geometry and UV data only. It does not create a material
 library (``.mtl``) file or embed, reference, or assign texture image files. Use the
 exported UV atlas with a separate texture-painting, baking, or material-authoring
 workflow.
+
+*********************
+Make a picture
+*********************
+
+.. literalinclude:: /how_to/import_export.py
+    :language: build123d
+    :start-after: [png]
+    :end-before: [png]
+
+:func:`~exporters3d.export_png` draws a shaded picture of a shape or
+assembly with OpenCascade's own renderer and saves it as PNG, without
+opening a viewer. The camera works as in
+:meth:`~topology.Mixin3D.drawing_view`: ``viewpoint`` is where the picture
+is taken from, ``look_at`` where it points and ``up`` which way is up, so
+a picture and a line drawing made with the same arguments match, as the
+drawing below does. Each part keeps its colour, and a colour's alpha makes
+it see-through.
+
+The picture is drawn with OpenGL, which needs a display. On a Linux server
+or in CI without one, run the script under a virtual X server, such as
+``xvfb-run python my_model.py``. On macOS, call it from the main thread.
 
 *********************
 Make a 2D drawing

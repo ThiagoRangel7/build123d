@@ -32,6 +32,8 @@ The exporters and importers. :ref:`import_export` shows how they are used.
 
 .. autofunction:: export_obj
 
+.. autofunction:: export_png
+
 .. autofunction:: export_step
 
 .. autofunction:: export_stl

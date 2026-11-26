@@ -22,7 +22,8 @@ jobs:
           optional-dependencies: "development"
 
       - name: Run tests and collect coverage
-        run: pytest --cov --cov-report=term-missing --cov-report=xml --cov-report=html
+        # export_png draws with OpenGL, which needs an X server
+        run: xvfb-run -a pytest --cov --cov-report=term-missing --cov-report=xml --cov-report=html
 
       - name: Enforce Patch Coverage
         if: '!cancelled()'

@@ -295,5 +295,6 @@ __all__ = [
     "export_stl",
     "export_brep",
     "export_obj",
+    "export_png",
     "export_to_pcbway",
 ]

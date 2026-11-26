@@ -32,5 +32,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           optional-dependencies: "development"
       - name: test
+        if: runner.os != 'Linux'
         run: |
           python -m pytest -n auto --benchmark-disable
+      - name: test
+        if: runner.os == 'Linux'
+        # export_png draws with OpenGL, which needs an X server
+        run: |
+          xvfb-run -a python -m pytest -n auto --benchmark-disable

@@ -29,10 +29,15 @@ license:
 # pylint has trouble with the OCP imports
 # pylint: disable=no-name-in-module, import-error
 
+import ctypes
+import ctypes.util
+import sys
 import tempfile
+import threading
 import warnings
 import webbrowser
 from datetime import datetime
+from functools import cache
 from io import BytesIO
 from os import PathLike, fsdecode
 from pathlib import Path
@@ -41,14 +46,29 @@ from typing import BinaryIO, cast
 import OCP.TopAbs as ta
 import requests
 from anytree import PreOrderIter
+from OCP.AIS import AIS_DisplayMode, AIS_InteractiveContext, AIS_Shape
 from OCP.APIHeaderSection import APIHeaderSection_MakeHeader
+from OCP.Aspect import (
+    Aspect_DisplayConnection,
+    Aspect_DisplayConnectionDefinitionError,
+    Aspect_TypeOfLine,
+    Aspect_Window,
+)
 from OCP.BinTools import BinTools, BinTools_FormatVersion
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepTools import BRepTools
+from OCP.Graphic3d import (
+    Graphic3d_Camera,
+    Graphic3d_MaterialAspect,
+    Graphic3d_NameOfMaterial,
+)
 from OCP.IFSelect import IFSelect_ReturnStatus
 from OCP.IGESControl import IGESControl_Controller
+from OCP.Image import Image_AlienPixMap
 from OCP.Interface import Interface_Static
 from OCP.Message import Message, Message_Gravity, Message_ProgressRange
+from OCP.OpenGl import OpenGl_GraphicDriver
+from OCP.Prs3d import Prs3d_LineAspect
 from OCP.RWGltf import RWGltf_CafWriter
 from OCP.STEPCAFControl import STEPCAFControl_Controller, STEPCAFControl_Writer
 from OCP.STEPControl import STEPControl_Controller, STEPControl_StepModelType
@@ -66,6 +86,7 @@ from OCP.TDF import TDF_Label
 from OCP.TDocStd import TDocStd_Document
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopTools import TopTools_FormatVersion
+from OCP.V3d import V3d_Viewer
 from OCP.XCAFApp import XCAFApp_Application
 from OCP.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
 from OCP.XSControl import XSControl_WorkSession
@@ -74,7 +95,7 @@ from threejs_materials import PbrProperties, inject_materials
 
 from build123d.build_constants import UNITS_PER_METER
 from build123d.build_enums import PrecisionMode, Unit
-from build123d.geometry import Location
+from build123d.geometry import Color, ColorLike, Location, Vector, VectorLike
 from build123d.topology import Compound, Curve, Part, Shape, Sketch
 
 
@@ -648,6 +669,260 @@ def export_obj(
         # BytesIO / BinaryIO stream
         file_path.write(content.encode("utf-8"))
 
+    return True
+
+
+# The color of shapes without one in export_png, as in OCP CAD Viewer
+DEFAULT_PNG_COLOR = Color(0xE8B024)
+
+
+@cache
+def _window_class():  # pragma: win32 cover
+    """Windows registers a window class once per process. None selects the
+    default window procedure"""
+    # pylint: disable=import-outside-toplevel
+    from OCP.WNT import WNT_WClass
+
+    cs_vredraw, cs_hredraw = 0x0001, 0x0002
+    return WNT_WClass(
+        TCollection_AsciiString("build123d"), None, cs_vredraw | cs_hredraw
+    )
+
+
+@cache
+def _start_ns_application() -> None:  # pragma: darwin cover
+    """A Cocoa window needs the application object, which Python doesn't make;
+    an application that has one already keeps it"""
+    objc = ctypes.cdll.LoadLibrary(
+        ctypes.util.find_library("objc") or "/usr/lib/libobjc.dylib"
+    )
+    ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+    objc.objc_getClass.restype = ctypes.c_void_p
+    objc.sel_registerName.restype = ctypes.c_void_p
+    objc.objc_msgSend.restype = ctypes.c_void_p
+    objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    objc.objc_msgSend(
+        objc.objc_getClass(b"NSApplication"),
+        objc.sel_registerName(b"sharedApplication"),
+    )
+
+
+def _offscreen_window(display: Aspect_DisplayConnection) -> Aspect_Window:
+    """A window for OpenGL that is never shown
+
+    OpenGL needs a window to draw for, but ``V3d_View.ToPixMap`` draws into a
+    buffer of its own of any size, so the window stays hidden and small, as in
+    OpenCascade's own offscreen viewer (``vinit -virtual``).
+    """
+    # The window classes exist only in the OCP build for their own system
+    # pylint: disable=import-outside-toplevel
+    window: Aspect_Window
+    if sys.platform == "win32":  # pragma: win32 cover
+        from OCP.WNT import WNT_Window
+
+        ws_popup = 0x80000000
+        window = WNT_Window("build123d", _window_class(), ws_popup, 0, 0, 64, 64)
+    elif sys.platform == "darwin":  # pragma: darwin cover
+        # A window without a native view (Aspect_NeutralWindow) only works with
+        # a graphics device, not with Apple's software renderer
+        from OCP.Cocoa import Cocoa_Window
+
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("On macOS, export_png works only in the main thread")
+        _start_ns_application()
+        window = Cocoa_Window("build123d", 0, 0, 64, 64)
+    else:  # pragma: linux cover
+        from OCP.Xw import Xw_Window
+
+        window = Xw_Window(display, "build123d", 0, 0, 64, 64)
+    window.SetVirtual(True)
+    return window
+
+
+@cache
+def _accelerated_opengl() -> bool:  # pragma: darwin cover
+    """Whether this Mac has a graphics device for OpenGL; a virtual machine may
+    have none, and then only Apple's software renderer draws"""
+    opengl = ctypes.cdll.LoadLibrary(
+        "/System/Library/Frameworks/OpenGL.framework/OpenGL"
+    )
+    accelerated = 73  # kCGLPFAAccelerated
+    attributes = (ctypes.c_int * 2)(accelerated, 0)
+    pixel_format, count = ctypes.c_void_p(None), ctypes.c_int(0)
+    opengl.CGLChoosePixelFormat(
+        attributes, ctypes.byref(pixel_format), ctypes.byref(count)
+    )
+    if not pixel_format.value:
+        return False
+    opengl.CGLReleasePixelFormat(pixel_format)
+    return True
+
+
+def _shaded_image(
+    to_export: Shape,
+    viewpoint: VectorLike | None,
+    up: VectorLike,
+    look_at: VectorLike | None,
+    size: tuple[int, int],
+    background: ColorLike,
+    edge_color: ColorLike | None,
+    edge_width: float,
+    margin: float,
+) -> Image_AlienPixMap:
+    """Draw a shaded picture of to_export; see export_png"""
+    if look_at is None:
+        look_at = to_export.bounding_box().center()
+    if viewpoint is None:
+        viewpoint = Vector(look_at) + (1, -1, 1)
+    direction = Vector(viewpoint) - Vector(look_at)
+    if direction.length == 0:
+        raise ValueError("viewpoint and look_at must be different points")
+    if direction.cross(Vector(up)).length == 0:
+        raise ValueError("up must not be parallel to the direction of view")
+
+    try:
+        display = Aspect_DisplayConnection()
+    except Aspect_DisplayConnectionDefinitionError as exc:
+        raise RuntimeError(
+            "export_png needs a display to draw with OpenGL. On Linux without "
+            "one, run under a virtual X server, such as with xvfb-run"
+        ) from exc
+    driver = OpenGl_GraphicDriver(display, False)
+    if sys.platform == "darwin":  # pragma: darwin cover
+        # Chosen before any view is made: OpenCascade crashes when it removes
+        # a view whose OpenGL context could not be made
+        driver.ChangeOptions().contextNoAccel = not _accelerated_opengl()
+    viewer = V3d_Viewer(driver)
+    viewer.SetDefaultLights()
+    viewer.SetLightOn()
+    context = AIS_InteractiveContext(viewer)
+    view = viewer.CreateView()
+    view.SetWindow(_offscreen_window(display))
+    view.SetBackgroundColor(Color(background).wrapped.GetRGB())
+    view.Camera().SetProjectionType(
+        Graphic3d_Camera.Projection_e.Projection_Orthographic
+    )
+    view.ChangeRenderingParams().NbMsaaSamples = 8
+
+    # OpenCascade's default material is shiny: lit from the camera, a face that
+    # looks straight at it would come out white
+    material = Graphic3d_MaterialAspect(
+        Graphic3d_NameOfMaterial.Graphic3d_NameOfMaterial_Plastered
+    )
+    edges = (
+        None
+        if edge_color is None
+        else Prs3d_LineAspect(
+            Color(edge_color).wrapped.GetRGB(),
+            Aspect_TypeOfLine.Aspect_TOL_SOLID,
+            edge_width,
+        )
+    )
+
+    # Each leaf at its place in to_export, which is placed as its bounding box
+    # and export_step place it, whatever assembly it may be part of
+    nodes: list[tuple[Shape, Location]] = [(to_export, Location())]
+    while nodes:
+        node, location = nodes.pop()
+        if node.is_empty:  # nothing to draw, and no location
+            continue
+        location = location * node.location
+        if node.children:
+            nodes.extend((child, location) for child in node.children)
+            continue
+        presentation = AIS_Shape(node.wrapped.Located(location.wrapped))
+        presentation.SetMaterial(material)
+        color = DEFAULT_PNG_COLOR if node.color is None else node.color
+        presentation.SetColor(color.wrapped.GetRGB())
+        presentation.SetTransparency(1 - color.wrapped.Alpha())
+        if edges is not None:
+            presentation.Attributes().SetFaceBoundaryDraw(True)
+            presentation.Attributes().SetFaceBoundaryAspect(edges)
+        context.Display(presentation, AIS_DisplayMode.AIS_Shaded.value, -1, False)
+
+    view.SetProj(*direction)
+    view.SetUp(*Vector(up))
+    view.FitAll(margin, False)
+    image = Image_AlienPixMap()
+    if not view.ToPixMap(image, *size):
+        raise RuntimeError("OpenGL could not draw the picture")
+    return image
+
+
+def export_png(
+    to_export: Shape,
+    file_path: PathLike | str | bytes,
+    viewpoint: VectorLike | None = None,
+    up: VectorLike = (0, 0, 1),
+    look_at: VectorLike | None = None,
+    size: tuple[int, int] = (1200, 900),
+    background: ColorLike = "white",
+    edge_color: ColorLike | None = "black",
+    edge_width: float = 1.0,
+    margin: float = 0.05,
+) -> bool:
+    """export_png
+
+    Write a shaded picture of a shape or assembly to a PNG file, drawn by
+    OpenCascade's own renderer with OpenGL and nothing shown on screen. The view
+    is orthographic and fitted to the picture; each part of an assembly is drawn
+    at its place in the assembly, in its own color or the one it inherits, with
+    its alpha as transparency. Its faces are matte, so a face that looks
+    straight at the camera keeps its color.
+
+    The camera follows :meth:`~topology.Mixin3D.drawing_view`, so a picture and a
+    line drawing taken with the same arguments match.
+
+    OpenGL draws only with a display: on Linux without one, run under a virtual
+    X server, such as with ``xvfb-run``. On macOS, call it from the main thread.
+    Without a graphics card, OpenGL falls back to a software renderer: Mesa's
+    on Linux and Apple's on macOS draw the same picture, while Microsoft's
+    OpenGL 1.1 on Windows draws the same shapes with simpler shading and no
+    antialiasing.
+
+    Args:
+        to_export (Shape): object or assembly
+        file_path (Union[PathLike, str, bytes]): PNG file path
+        viewpoint (VectorLike, optional): where the view is taken from.
+            Defaults to None, the point (1, -1, 1) from look_at.
+        up (VectorLike, optional): direction of the picture's y axis.
+            Defaults to (0, 0, 1).
+        look_at (VectorLike, optional): point the view is aimed at.
+            Defaults to None (center of shape).
+        size (tuple[int, int], optional): picture width and height in pixels.
+            Defaults to (1200, 900).
+        background (ColorLike, optional): background color. Defaults to "white".
+        edge_color (ColorLike, optional): color of the edges between faces, or
+            None to leave them out. Defaults to "black".
+        edge_width (float, optional): width of the edges in pixels.
+            Defaults to 1.0.
+        margin (float, optional): empty border around the shape, as a fraction
+            of the picture. Defaults to 0.05.
+
+    Raises:
+        ValueError: viewpoint equals look_at, or up is parallel to the view
+        RuntimeError: no display, or the picture could not be drawn or written
+
+    Returns:
+        bool: success
+    """
+    _nothing_to_export(to_export)
+    if min(size) < 1:
+        raise ValueError(f"size must be at least one pixel each way, not {size}")
+    image = _shaded_image(
+        to_export,
+        viewpoint,
+        up,
+        look_at,
+        size,
+        background,
+        edge_color,
+        edge_width,
+        margin,
+    )
+    path = fsdecode(file_path)
+    if not image.Save(TCollection_AsciiString(path)):
+        raise RuntimeError(f"Failed to write PNG file {path}")
     return True
 
 

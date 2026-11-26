@@ -29,6 +29,7 @@ import io
 import json
 import os
 import re
+import struct
 import sys
 import unittest
 from datetime import datetime
@@ -53,9 +54,11 @@ from build123d.exporters3d import (
     export_obj,
     export_step,
     export_stl,
+    export_png,
     export_to_pcbway,
+    _shaded_image,
 )
-from build123d.geometry import Color, Pos, Vector, VectorLike
+from build123d.geometry import Color, Location, Pos, Vector, VectorLike
 from build123d.objects_curve import Line
 from build123d.objects_part import Box, Cone, Cylinder, Sphere
 from build123d.objects_sketch import Circle, Rectangle
@@ -510,6 +513,132 @@ def test_exporters_to_binary_fileobj(exporter):
 def test_exporters_to_stdout(exporter):
     box = Box(1, 1, 1).locate(Pos(-1, -2, -3))
     exporter(box, sys.stdout.buffer)
+
+
+def png_size(path: Path) -> tuple[int, int]:
+    """Width and height from a PNG file's header"""
+    data = Path(path).read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    return struct.unpack(">II", data[16:24])
+
+
+def shaded(shape, **options):
+    """A small picture of shape from the front, without edges, on white"""
+    settings = {
+        "viewpoint": (0, -10, 0),
+        "up": (0, 0, 1),
+        "look_at": (0, 0, 0),
+        "size": (60, 40),
+        "background": "white",
+        "edge_color": None,
+        "edge_width": 1.0,
+        "margin": 0.05,
+    }
+    settings.update(options)
+    return _shaded_image(shape, **settings)
+
+
+def pixel(image, x: int, y: int) -> tuple[float, float, float]:
+    color = image.PixelColor(x, y).GetRGB()
+    return color.Red(), color.Green(), color.Blue()
+
+
+def pixels(image) -> list[tuple[float, float, float]]:
+    return [
+        pixel(image, x, y) for y in range(image.SizeY()) for x in range(image.SizeX())
+    ]
+
+
+def red_box(alpha: float = 1.0) -> Box:
+    box = Box(2, 1, 1)
+    box.color = Color(1, 0, 0, alpha)
+    return box
+
+
+class TestExportPng(DirectApiTestCase):
+    def test_export_png(self):
+        path = self.tmp_path / "box.png"
+        self.assertTrue(export_png(Box(1, 2, 3), path, size=(120, 90)))
+        self.assertEqual(png_size(path), (120, 90))
+
+    def test_colors(self):
+        image = shaded(red_box())
+        red, green, blue = pixel(image, 30, 20)
+        self.assertGreater(red, 0.4)
+        self.assertLess(green, red / 2)
+        self.assertLess(blue, red / 2)
+        self.assertTrue(all(value > 0.95 for value in pixel(image, 0, 0)))
+
+        image = shaded(red_box(), background="black")
+        self.assertTrue(all(value < 0.05 for value in pixel(image, 0, 0)))
+
+    def test_default_color(self):
+        red, green, blue = pixel(shaded(Box(2, 1, 1)), 30, 20)
+        self.assertGreater(red, green)
+        self.assertGreater(green, blue)
+
+    def test_transparency(self):
+        opaque = pixel(shaded(red_box()), 30, 20)
+        clear = pixel(shaded(red_box(alpha=0.3)), 30, 20)
+        self.assertGreater(clear[1], opaque[1] + 0.1)
+
+    def test_edges(self):
+        def dark(image):
+            return sum(1 for color in pixels(image) if max(color) < 0.2)
+
+        self.assertGreater(dark(shaded(red_box(), edge_color="black")), 0)
+        self.assertEqual(dark(shaded(red_box())), 0)
+
+    def test_place_in_assembly(self):
+        """An assembly's parts are drawn at their places in it, and the
+        assembly the exported shape belongs to doesn't move it"""
+        box = red_box()
+        assembly = Compound(children=[box])
+        assembly.location = Location((50, 0, 0), (0, 0, 45))
+        alone = red_box().moved(assembly.location)
+        view = {"viewpoint": (60, -20, 10), "look_at": (50, 0, 0)}
+        self.assertEqual(
+            pixels(shaded(assembly, **view)), pixels(shaded(alone, **view))
+        )
+        self.assertEqual(pixels(shaded(box)), pixels(shaded(red_box())))
+
+    def test_empty_part_in_assembly(self):
+        assembly = Compound(children=[red_box(), Compound()])
+        self.assertEqual(pixels(shaded(assembly)), pixels(shaded(red_box())))
+
+    def test_defaults_to_whole_shape(self):
+        image = shaded(red_box(), viewpoint=None, look_at=None)
+        self.assertTrue(any(max(color) < 0.95 for color in pixels(image)))
+
+    def test_bad_view(self):
+        with self.assertRaises(ValueError):
+            shaded(red_box(), viewpoint=(1, 2, 3), look_at=(1, 2, 3))
+        with self.assertRaises(ValueError):
+            shaded(red_box(), viewpoint=(0, 0, 10), up=(0, 0, 1))
+        with self.assertRaises(ValueError):
+            export_png(red_box(), self.tmp_path / "box.png", size=(0, 10))
+
+    def test_nothing_to_export(self):
+        with self.assertRaises(ValueError):
+            export_png(Compound(), self.tmp_path / "empty.png")
+
+    def test_unwritable(self):
+        with self.assertRaises(RuntimeError):
+            export_png(red_box(), self.tmp_path / "missing" / "box.png")
+
+
+@pytest.mark.parametrize("format", (Path, os.fsencode, os.fsdecode))
+def test_export_png_pathlike(tmp_path, format):
+    path = tmp_path / "box.png"
+    assert export_png(Box(1, 1, 1), format(path), size=(30, 20))
+    assert png_size(path) == (30, 20)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Only Linux needs an X server")
+def test_export_png_without_display(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISPLAY", ":12345")
+    with pytest.raises(RuntimeError, match="xvfb-run"):
+        export_png(Box(1, 1, 1), tmp_path / "box.png")
 
 
 class TestTessellateWithUVs(DirectApiTestCase):
