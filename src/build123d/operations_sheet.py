@@ -248,17 +248,72 @@ def _flange_faces(
         position, angle, inside_radius, sheet_parameters.thickness, allowance
     )
     zoned, additions, replaced = _bend_zones(target, edges, gaps, setback)
-    for zone, taken in zoned:
-        if setback < TOLERANCE:
+    # the new material each flange is made of, flat: from the edge on
+    reach = allowance - setback + leg_length
+    beyond = [
+        [_orient_face(Face.extrude(zone.edge, zone.outward * reach), zone.normal)]
+        for zone, _ in zoned
+    ]
+    mitred = [False] * len(zoned)
+    if min(gaps) < 0:
+        # Flanges run past the ends of their edges can lie over each other on
+        # the blank, which is one sheet and cannot be there twice. Each gives
+        # up its share of the overlap along the miter line between them
+        for first, second in combinations(range(len(zoned)), 2):
+            if not beyond[first] or not beyond[second]:
+                continue
+            zones = (zoned[first][0], zoned[second][0])
+            overlap = [
+                piece
+                for face in beyond[first]
+                for piece in _planar_pieces(face.intersect(*beyond[second]))
+            ]
+            bisector = zones[0].outward + zones[1].outward
+            if not overlap or bisector.length < TOLERANCE:
+                continue
+            starts = [zone.edge.position_at(0) for zone in zones]
+            along = [zone.edge.tangent_at() for zone in zones]
+            crossing = along[0].cross(along[1]).dot(zones[0].normal)
+            if abs(crossing) < TOLERANCE:  # edges in line: split the overlap
+                corner = overlap[0].center()
+            else:  # the corner the two edges make, where their lines meet
+                corner = starts[0] + along[0] * (
+                    (starts[1] - starts[0]).cross(along[1]).dot(zones[0].normal)
+                    / crossing
+                )
+            across = bisector.cross(zones[0].normal)
+            middles = [zone.edge.position_at(0.5) - corner for zone in zones]
+            sides = [middle.dot(across) for middle in middles]
+            if sides[0] * sides[1] >= 0:
+                continue
+            # at an inside corner the flanges overlap whatever their gaps
+            # are, which is not what a negative gap is being asked to close
+            if abs(crossing) >= TOLERANCE and (
+                middles[1].dot(zones[0].outward) > 0
+                or middles[0].dot(zones[1].outward) > 0
+            ):
+                continue
+            for index, own in ((first, sides[0]), (second, sides[1])):
+                lost = [
+                    part
+                    for piece in overlap
+                    for part in _fold_pieces(piece, corner, across, own < 0)
+                ]
+                beyond[index] = [
+                    kept
+                    for face in beyond[index]
+                    for kept in _planar_pieces(face.cut(*lost))
+                ]
+                mitred[index] = True
+    for (zone, taken), new, cut in zip(zoned, beyond, mitred):
+        if setback < TOLERANCE and not cut:
             additions += _bend_and_leg(zone, angle, radius, leg_length)
             continue
         # the flat the bend and its wall are made from: what came out of the
         # face behind the edge, and new material from the edge on
-        beyond = Face.extrude(
-            zone.edge, zone.outward * (allowance - setback + leg_length)
+        additions += _bend_and_leg(
+            zone, angle, radius, leg_length, (taken + new, allowance)
         )
-        flat = taken + [_orient_face(beyond, zone.normal)]
-        additions += _bend_and_leg(zone, angle, radius, leg_length, (flat, allowance))
     return additions, replaced
 
 
@@ -621,9 +676,12 @@ def flange(
             the bend and wall past the end of the edge instead: a wall wider
             than the edge it folds from, or walls off two edges meeting at
             a corner that reach each other once a corner relief has cleared
-            the bends there. Those walls must stop short of each other by a
-            clearance; walls that touch are sewn together and the sheet can
-            no longer be unfolded. Defaults to 0.
+            the bends there. Flanges extended this way would lie over
+            each other on the blank at an outside corner, so each is cut
+            back to the miter line between them, the bisector of the corner,
+            and the blank has no material there twice. Those walls must stop
+            short of each other by a clearance; walls that touch are sewn
+            together and the sheet can no longer be unfolded. Defaults to 0.
         position: Where the bend sits relative to the edge. Defaults to
             ``BEND_OUTSIDE``, the whole bend past the edge.
         length_mode: Which side of the triangle the wall makes with its face
@@ -756,6 +814,8 @@ def bend(
     part on it. Whatever the blank's outline does across that strip - a taper,
     a corner round, a notch, a hole - rolls into the bend with it, so the strip
     need not be the same width at both ends and ``unfold`` gives the blank back.
+    A hole or slot lying on the line leaves it in several stretches; any one of
+    them names the fold, and the sheet folds along them all.
 
     Sizes are measured on the reference surface, as everywhere else in
     ``BuildSheet``, so the sheet is the reference surface of the part you get
@@ -1911,6 +1971,7 @@ def corner_relief(
     relief_type: Literal[ReliefType.ROUND] = ReliefType.ROUND,
     *,
     radius: float,
+    offset: float = 0,
     sheet_parameters: SheetMetalParameters | None = None,
 ) -> Shell: ...
 
@@ -1921,6 +1982,7 @@ def corner_relief(
     relief_type: Literal[ReliefType.SQUARE],
     *,
     size: float,
+    offset: float = 0,
     sheet_parameters: SheetMetalParameters | None = None,
 ) -> Shell: ...
 
@@ -1932,6 +1994,7 @@ def corner_relief(
     *,
     length: float,
     width: float,
+    offset: float = 0,
     sheet_parameters: SheetMetalParameters | None = None,
 ) -> Shell: ...
 
@@ -1955,6 +2018,7 @@ def corner_relief(
     length: float | None = None,
     width: float | None = None,
     depth: float | None = None,
+    offset: float = 0,
     sheet_parameters: SheetMetalParameters | None = None,
 ) -> Shell:
     """Cut corner relief where two bends meet.
@@ -1978,6 +2042,14 @@ def corner_relief(
     the flange beyond it, as it would on the blank. ``CONSTANT_WIDTH`` is
     defined by the formed part instead.
 
+    Those three are centred on the corner. ``offset`` moves the centre along
+    the corner's miter line, the bisector of the two bends, by a distance
+    measured on the blank: outward, between the flanges, when positive and
+    into the base when negative. That places a narrow relief anywhere along
+    the cut between two flanges closed over the corner with a negative
+    ``gaps``. A relief moved clear of the corner leaves the corner vertex
+    where it is.
+
     Args:
         vertices: Corner vertex or vertices to relieve.
         relief_type: Shape of the relief. Defaults to ``ROUND``.
@@ -1987,6 +2059,10 @@ def corner_relief(
         width: Slot width for ``OBROUND``.
         depth: Distance the relief reaches into the sheet for
             ``CONSTANT_WIDTH``.
+        offset: Distance on the blank from the corner to the centre of a
+            ``ROUND``, ``SQUARE`` or ``OBROUND`` relief, along the miter line.
+            Positive is outward, between the flanges. Defaults to 0, centred
+            on the corner.
         sheet_parameters: Material and reference-surface parameters. Required
             in Algebra mode and supplied by ``BuildSheet`` in Builder mode - a
             relief is laid out on the blank, so its shape depends on where the
@@ -2033,6 +2109,13 @@ def corner_relief(
 
     values = {name: measurement(name) for name in required}
     _reject_unwanted_relief_keywords(relief_type, supplied, required)
+    if not isinstance(offset, (int, float)):
+        raise ValueError("offset must be a number")
+    if offset != 0 and relief_type is ReliefType.CONSTANT_WIDTH:
+        raise ValueError(
+            f"{relief_type} does not accept offset - it carries the gap between "
+            "the flanges through the corner, so there is no centre to move"
+        )
 
     profile: Face | None = None
     reach = 0.0
@@ -2053,7 +2136,7 @@ def corner_relief(
     )
     for vertex in vertex_list:
         target = _cut_corner_relief(
-            target, vertex, relief_type, profile, reach, parameters
+            target, vertex, relief_type, profile, reach, parameters, offset
         )
     return _publish(context, target)
 
@@ -2065,6 +2148,7 @@ def _cut_corner_relief(
     profile: Face | None,
     depth: float,
     parameters: SheetMetalParameters,
+    offset: float = 0.0,
 ) -> Shell:
     """Cut one corner, by whichever route the relief type is defined in."""
     corner = Vector(vertex)
@@ -2083,13 +2167,19 @@ def _cut_corner_relief(
         cut = shell.cut(cutter)
         result = cut if isinstance(cut, Shell) else Shell(_faces_of(cut))
     elif profile is not None:
+        if offset:
+            # the corner's flat axes are the miter line turned 45 degrees each
+            # way, whatever angle the corner makes, so the miter is always
+            # their diagonal and a step along it is the same in x and y
+            step = offset / sqrt(2)
+            profile = profile.translate((step, step, 0))
         result = _replace_relief_faces(
             shell, _trim_faces(at.frames + at.flanges, profile)
         )
     else:
         raise ValueError(f"no profile built for {relief_type}")
 
-    _check_corner_detached(shell, result, corner)
+    _check_corner_detached(shell, result, corner, offset == 0)
     return result
 
 
@@ -2305,13 +2395,19 @@ def _corner_frames(
 ) -> tuple[list[UVFrame], list[UVFrame], list[Vector], bool]:
     """Flat frames for the faces meeting at one corner of a planar face.
 
-    All share one flat coordinate system with its origin at ``corner``:
-    ``x`` measures past the tangent line of one bend and ``y`` past the other.
+    All share one flat coordinate system, that of the blank, with its origin
+    at ``corner``. Its axes are square to each other and lie either side of
+    the corner's miter line, the bisector of the two bends, which is the
+    diagonal ``x = y``. At a square corner ``x`` runs straight into one bend
+    and ``y`` into the other; at any other corner each leans toward the
+    miter by the same amount, so a profile keeps its shape and stays
+    symmetric about the miter.
+
     Returns the base's frame followed by the two bends', then the frames of
     the flanges past the bends - each starting where its bend's blank width
     ends, so a relief wide enough to pass through a bend carries on into the
-    flat beyond it as it would on the blank - the 3D directions of the two
-    flat axes, and whether the sheet wraps around the corner rather than
+    flat beyond it as it would on the blank - the 3D directions into the two
+    bends, and whether the sheet wraps around the corner rather than
     stopping at it.
     """
     # The two bends whose tangent lines cross at this corner. They are found
@@ -2339,24 +2435,34 @@ def _corner_frames(
         )
 
     # each bend unrolls perpendicular to its own tangent line, away from the
-    # base: x unrolls the first bend and y the second
-    axis_dir = [_fold_outward(base, edge) for edge, _ in touching]
-    frames = [_affine_frame(base, corner, (axis_dir[0], axis_dir[1]))]
+    # base. The flat axes are the miter line turned 45 degrees each way, which
+    # at a square corner are those two directions themselves
+    axis_dir = [_fold_outward(base, edge).normalized() for edge, _ in touching]
+    bisector = (axis_dir[0] + axis_dir[1]).normalized()
+    square = (axis_dir[0] - axis_dir[1]).normalized()
+    flat_axes = ((bisector + square) / sqrt(2), (bisector - square) / sqrt(2))
+    frames = [_affine_frame(base, corner, flat_axes)]
     flanges = []
-    for index, (edge, cylinder) in enumerate(touching):
+    for (edge, cylinder), outward in zip(touching, axis_dir):
         # measured on the neutral axis, so the flat coordinates are those of
-        # the blank rather than of the reference surface
+        # the blank rather than of the reference surface: what a flat axis
+        # has across the fold line shrinks onto the bend, and what it has
+        # along the line does not
         radius = cylinder.radius
         if radius is None:
             raise ValueError("relief expects a cylindrical bend face")
         rolling = neutral_radius(radius, parameters, is_positive_bend(cylinder.wrapped))
-        scale = radius / rolling
-        scales = (scale, 1.0) if index == 0 else (1.0, scale)
-        frames.append(
-            _affine_frame(cylinder, corner, (axis_dir[0], axis_dir[1]), scales)
+        along = edge.tangent_at()
+        shrink = radius / rolling
+        on_bend = (
+            along * flat_axes[0].dot(along)
+            + outward * flat_axes[0].dot(outward) * shrink,
+            along * flat_axes[1].dot(along)
+            + outward * flat_axes[1].dot(outward) * shrink,
         )
+        frames.append(_affine_frame(cylinder, corner, on_bend))
         flange_frame = _flange_frame(
-            shell, base, edge, cylinder, corner, axis_dir, index, rolling
+            shell, base, edge, cylinder, corner, outward, flat_axes, rolling
         )
         if flange_frame is not None:
             flanges.append(flange_frame)
@@ -2369,16 +2475,18 @@ def _flange_frame(
     fold: Edge,
     cylinder: Face,
     corner: Vector,
-    axis_dir: list[Vector],
-    index: int,
+    outward: Vector,
+    flat_axes: tuple[Vector, Vector],
     rolling: float,
 ) -> UVFrame | None:
     """The flat frame of the flange past a bend, in the corner's coordinates.
 
     On the blank the flange starts one bend width - the neutral radius times
     the bend angle - past the fold line, so its frame places the corner's
-    image on its own fold line that far along the bend's unroll axis. None
-    where nothing planar follows the bend.
+    image on its own fold line that far across the fold, along ``outward``.
+    Past it, what a flat axis has across the fold line runs into the flange
+    and what it has along the line runs along it. None where nothing planar
+    follows the bend.
     """
     along = fold.tangent_at()
     far = None
@@ -2404,8 +2512,11 @@ def _flange_frame(
     offset = corner - start
     origin = start + along * offset.dot(along)
     into = -_fold_outward(flat, far_edge)
-    axes = (into, axis_dir[1]) if index == 0 else (axis_dir[0], into)
-    origin_at = (width, 0.0) if index == 0 else (0.0, width)
+    axes = (
+        along * flat_axes[0].dot(along) + into * flat_axes[0].dot(outward),
+        along * flat_axes[1].dot(along) + into * flat_axes[1].dot(outward),
+    )
+    origin_at = (width * outward.dot(flat_axes[0]), width * outward.dot(flat_axes[1]))
     return _affine_frame(flat, origin, axes, origin_at=origin_at)
 
 
@@ -2462,13 +2573,19 @@ def _trim_faces(frames: list[UVFrame], profile: Face) -> dict[Face, Face]:
 # --------------------------------------------------------------------------
 
 
-def _check_corner_detached(before: Shell, after: Shell, corner: Vector) -> None:
+def _check_corner_detached(
+    before: Shell, after: Shell, corner: Vector, centred: bool = True
+) -> None:
     """A corner relief must remove the corner.
 
     A profile closed at or before the corner still cuts faithfully - it takes
-    a lens off an edge - but leaves the corner vertex in place.
+    a lens off an edge - but leaves the corner vertex in place. One moved
+    along the miter line is not ``centred`` and may leave the corner behind
+    it on purpose; it still has to remove something.
     """
-    if any((Vector(v) - corner).length < TOLERANCE for v in after.vertices()):
+    if centred and any(
+        (Vector(v) - corner).length < TOLERANCE for v in after.vertices()
+    ):
         raise ValueError(
             "the corner vertex survived the relief - the profile closes at or "
             "before the corner instead of opening through it"
@@ -2509,15 +2626,15 @@ class _Corner:
     point: Vector
     frames: list[UVFrame]  # the base's frame, then the two bends'
     flanges: list[UVFrame]  # the flats past the bends, where there are any
-    axes: list[Vector]  # the flat axes in 3D, each into one bend
+    axes: list[Vector]  # the 3D directions into the two bends, across their folds
     wrapped: bool  # the sheet wraps around the corner rather than stopping
 
     @property
     def mirror_normal(self) -> Vector:
         """The normal of the plane bisecting the corner.
 
-        The two unroll directions are the frames' flat axes; their difference
-        bisects the corner, so the two flanges sit symmetrically either side.
+        The difference of the two unroll directions lies across the miter
+        line, so the two flanges sit symmetrically either side.
         """
         first, second = (axis.normalized() for axis in self.axes)
         return (first - second).normalized()
@@ -3082,8 +3199,9 @@ def _fold_site(
     and ``reach`` how far past the line the flat the fold consumes ends. The
     face across the line is cut at those two lines and its pieces sorted by
     what they are joined to: a piece between the lines that meets the fold
-    line rolls into the fold; a piece before the near line that meets a rolled
-    piece stays flat, hinged to it; everything else is carried rigidly with
+    line, or another stretch of it past a cut-out, rolls into the fold; a
+    piece before the near line that meets a rolled piece stays flat, hinged
+    to it; everything else is carried rigidly with
     the far side, whichever side of the lines it lies on - a blank widening
     past the line's ends, or the rest of a body that a tear has freed from
     the fold. A piece that would have to stay flat but is also joined to what
@@ -3105,7 +3223,24 @@ def _fold_site(
     for piece in _fold_pieces(partner, near, across, True):
         band += _planar_pieces(_fold_pieces(piece, far, across, False))
         onward += _planar_pieces(_fold_pieces(piece, far, across, True))
-    rolled = [piece for piece in band if _touch_along_an_edge(piece, line)]
+    # A cut-out on the line leaves it in several stretches, each an edge the
+    # two faces share. They are one fold: folding only the stretch that was
+    # selected would tear the sheet along the others
+    start, direction = line.position_at(0), line.tangent_at()
+    stretches = [
+        edge
+        for edge in face.edges().filter_by(GeomType.LINE)
+        if any(other.is_same(partner) for other in _neighbours(edge, shell))
+        and all(
+            (edge.position_at(t) - start).cross(direction).length < TOLERANCE
+            for t in (0, 1)
+        )
+    ]
+    rolled = [
+        piece
+        for piece in band
+        if any(_touch_along_an_edge(piece, stretch) for stretch in stretches)
+    ]
     stays = [
         piece
         for piece in before

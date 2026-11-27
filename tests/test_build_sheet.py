@@ -1169,6 +1169,65 @@ class TestFlangeNegativeGaps(unittest.TestCase):
         self.assertTrue(bp.part.is_valid)
         self.assertEqual(len(bp.part.solids()), 1)
 
+    @staticmethod
+    def doubled(flat) -> float:
+        """How much of a flat pattern lies under more than one of its faces."""
+        faces = flat.faces()
+        union = faces[0].fuse(*faces[1:])
+        return sum(precise_area(f) for f in faces) - precise_area(union)
+
+    def test_flanges_extended_at_a_corner_are_mitered_on_the_blank(self):
+        """Two flanges run past a corner would cover the same patch of the
+        blank. Each is cut back to the bisector, so no material is there
+        twice, and what is cut is the patch they shared"""
+        allowance = pi / 2 * 2.25  # r=1.5, t=1.5, K=0.5
+        # the shared patch is a kite: the gap squared times the tangent of
+        # half the corner's angle
+        for sides, shared in ((4, 1.3**2), (3, 1.3**2 * tan(radians(30)))):
+            with self.subTest(sides=sides):
+                with BuildSheet(thickness=1.5, bend_radius=1.5) as bs:
+                    with BuildSketch():
+                        RegularPolygon(60, sides)
+                    base = bs.sheet.area
+                    edge = bs.rims()[0].length
+                    flange(bs.rims(), 40, gaps=-1.3)
+                    flat, _ = unfold()
+                self.assertTrue(bs.sheet.is_valid)
+                self.assertAlmostEqual(self.doubled(flat), 0, 5)
+                extended = sides * (edge + 2 * 1.3) * (allowance + 40)
+                self.assertAlmostEqual(
+                    precise_area(flat), base + extended - sides * shared, 4
+                )
+
+    def test_flanges_extended_toward_each_other_share_the_overlap(self):
+        """Two flanges off edges in line, each run past its end into the
+        other, are cut where they meet"""
+        with BuildSheet(thickness=1.5, bend_radius=1.5) as bs:
+            with BuildSketch():
+                Rectangle(100, 60)
+                with Locations((0, 30)):
+                    Rectangle(4, 10, mode=Mode.SUBTRACT)
+            flange(bs.rims().group_by(Axis.Y)[-1], 20, gaps=(-3, -3))
+            flat, _ = unfold()
+        self.assertEqual(len(bs.bends()), 2)
+        self.assertAlmostEqual(self.doubled(flat), 0, 5)
+
+    def test_a_narrow_relief_runs_along_the_miter_through_the_bend(self):
+        """A slot along the diagonal used to cut slivers off the doubled
+        corner and was refused once it reached through the bend"""
+        with BuildSheet(thickness=1.5, bend_radius=1.5) as bs:
+            with BuildSketch():
+                Rectangle(100, 100)
+            flange(bs.rims(), 40, gaps=-1.3)
+            corners = (
+                bs.flats().filter_by(Axis.Z).vertices().filter_by(Convexity.CONVEX)
+            )
+            corner_relief(corners, relief_type=ReliefType.OBROUND, length=8, width=0.5)
+            flat, _ = unfold()
+        self.assertEqual(len(bs.sheet.faces()), 9)
+        self.assertTrue(bs.sheet.is_valid)
+        self.assertAlmostEqual(self.doubled(flat), 0, 5)
+
     def test_walls_that_touch_close_the_sheet(self):
         """At exactly the radius the walls meet and are sewn together into a
         sharp corner with no bend in it, which the unfold refuses"""
@@ -2273,6 +2332,51 @@ class TestFoldExtent(unittest.TestCase):
             tab = bs.flats().sort_by(Axis.Y)[-1]
             with self.assertRaisesRegex(ValueError, "would tear"):
                 bend(tab.fold_lines()[0], 90)
+
+    def test_a_cut_out_on_the_line_folds_on_both_sides_of_it(self):
+        """A hole or slot that divides the strip leaves the line in two
+        stretches. Either one names the fold, and the sheet folds along both
+        rather than tearing along the one not selected."""
+        cases = (
+            ("hole", BendPosition.CENTER, lambda: Circle(5, mode=Mode.SUBTRACT)),
+            (
+                "slot",
+                BendPosition.BEND_OUTSIDE,
+                lambda: Rectangle(30, 4, mode=Mode.SUBTRACT),
+            ),
+        )
+        for name, position, cut_out in cases:
+            for stretch in (0, 1):
+                with self.subTest(cut_out=name, stretch=stretch):
+                    with BuildSheet(thickness=1, bend_radius=4) as bs:
+                        with BuildSketch():
+                            Rectangle(60, 30)
+                            cut_out()
+                        blank_area = bs.sheet.area
+                        split(bs.flats()[0], bisect_by=Plane.YZ, keep=Keep.BOTH)
+                        lines = bs.flats().sort_by(Axis.X)[0].fold_lines()
+                        self.assertEqual(len(lines), 2)
+                        bend(lines[stretch], 90, position=position)
+                        lower, upper = bs.bends().sort_by(Axis.Y)
+                        self.assertAlmostEqual(lower.bounding_box().min.Y, -15, 5)
+                        self.assertAlmostEqual(upper.bounding_box().max.Y, 15, 5)
+                        self.assertAlmostEqual(lower.area, upper.area, 5)
+                    self.assertTrue(bs.sheet.is_valid)
+                    flat = unfold(bs.sheet, bs.sheet_parameters).flat
+                    self.assertAlmostEqual(precise_area(flat), blank_area, 6)
+
+    def test_a_jog_folds_on_both_sides_of_a_cut_out_on_its_line(self):
+        with BuildSheet(thickness=1, bend_radius=2) as bs:
+            with BuildSketch():
+                Rectangle(100, 60)
+                Rectangle(40, 6, mode=Mode.SUBTRACT)
+            blank_area = bs.sheet.area
+            split(bs.flats()[0], bisect_by=Plane.YZ, keep=Keep.BOTH)
+            jog(bs.flats().sort_by(Axis.X)[0].fold_lines()[0], offset=10)
+            self.assertEqual(len(bs.bends()), 4)  # two bends, each side of the slot
+        self.assertTrue(bs.sheet.is_valid)
+        flat = unfold(bs.sheet, bs.sheet_parameters).flat
+        self.assertAlmostEqual(precise_area(flat), blank_area, 6)
 
 
 class TestStaleSelections(unittest.TestCase):
@@ -3557,6 +3661,99 @@ class TestCornerRelief(unittest.TestCase):
         self.assertFalse(
             any((Vector(v) - corner).length < TOLERANCE for v in result.vertices())
         )
+
+    def test_offset_moves_the_relief_along_the_miter_line(self):
+        """The distance is measured from the corner along the bisector of the
+        two bends, whatever angle the corner makes, and a negative one goes
+        into the base"""
+        for sides in (3, 4, 6):
+            with self.subTest(sides=sides):
+                with BuildSheet(thickness=1, bend_radius=2) as builder:
+                    with BuildSketch():
+                        RegularPolygon(40, sides)
+                    flange(builder.rims(), 10, gaps=3)
+                    base = builder.flats().filter_by(Axis.Z)[0]
+                    corner = base.vertices().sort_by(Axis.X)[-1]
+                    corner_relief(corner, ReliefType.ROUND, radius=1, offset=-5)
+                    (hole,) = builder.flats().filter_by(Axis.Z)[0].inner_wires()
+                # the corner is at (40, 0) and its bisector is the X axis
+                self.assertAlmostEqual(hole.bounding_box().center(), (35, 0, 0), 5)
+                # moved clear of the corner, the relief leaves it in place
+                self.assertTrue(
+                    any(
+                        (Vector(v) - Vector(40, 0, 0)).length < TOLERANCE
+                        for v in builder.sheet.vertices()
+                    )
+                )
+
+    def test_a_relief_keeps_its_shape_and_place_at_any_corner_angle(self):
+        """The corner is laid out on the blank's own square axes, so a relief
+        is the same shape on the blank whatever angle the corner makes, on
+        the base, across the bends and into the flanges, and an offset is a
+        true distance along the miter either way"""
+
+        def blank(flat: Shell):
+            faces = flat.faces()
+            return faces[0].fuse(*faces[1:])
+
+        for sides in (3, 6):
+            for offset in (-3, 0, 2):
+                with self.subTest(sides=sides, offset=offset):
+                    with BuildSheet(thickness=1, bend_radius=2) as builder:
+                        with BuildSketch():
+                            RegularPolygon(40, sides)
+                        flange(builder.rims(), 12, gaps=3)
+                        before = blank(unfold().flat)
+                        base = builder.flats().filter_by(Axis.Z)[0]
+                        corner = base.vertices().sort_by(Axis.X)[-1]
+                        corner_relief(corner, ReliefType.ROUND, radius=7, offset=offset)
+                        after = blank(unfold().flat)
+                    # the corner is at (40, 0) and its miter is the X axis
+                    expected = before - Pos(40 + offset, 0) * Circle(7)
+                    self.assertAlmostEqual(after.area, expected.area, 3)
+                    self.assertAlmostEqual((after - expected).area, 0, 3)
+
+    def test_an_offset_relief_sits_on_the_miter_of_a_closed_corner(self):
+        """Between two flanges closed over a corner, a relief moved halfway
+        along their miter lies wholly in the two bends: the blank loses the
+        whole circle and the base nothing"""
+        with BuildSheet(thickness=1.5, bend_radius=1.5) as builder:
+            with BuildSketch():
+                Rectangle(100, 100)
+            flange(builder.rims(), 40, gaps=-1.3)
+            before = precise_area(unfold().flat)
+            base = builder.flats().filter_by(Axis.Z)[0]
+            corners = base.vertices().filter_by(Convexity.CONVEX)
+            corner_relief(
+                corners, ReliefType.ROUND, radius=0.3, offset=1.3 * sqrt(2) / 2
+            )
+            after = precise_area(unfold().flat)
+            self.assertAlmostEqual(
+                builder.flats().filter_by(Axis.Z)[0].area, base.area, 6
+            )
+        self.assertTrue(builder.sheet.is_valid)
+        self.assertAlmostEqual(before - after, 4 * pi * 0.3**2, 4)
+
+    def test_offset_is_refused_where_it_means_nothing(self):
+        sheet = self.two_flange_sheet().sheet_local
+        corner = self.shared_corner(sheet)
+        with self.assertRaisesRegex(ValueError, "does not accept offset"):
+            corner_relief(
+                corner,
+                ReliefType.CONSTANT_WIDTH,
+                depth=2,
+                offset=1,
+                sheet_parameters=self.PARAMETERS,
+            )
+        # past both bends with no flange there, the relief has nothing to cut
+        with self.assertRaisesRegex(ValueError, "removed nothing"):
+            corner_relief(
+                corner,
+                ReliefType.ROUND,
+                radius=1,
+                offset=30,
+                sheet_parameters=self.PARAMETERS,
+            )
 
     def test_builder_mode(self):
         with BuildSheet(thickness=1, bend_radius=2) as builder:
