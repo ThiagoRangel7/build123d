@@ -663,14 +663,27 @@ def test_export_png_matches_svg(tmp_path, viewpoint, up):
     with Image.open(path) as image:
         assert 0 <= image.width - width / 25.4 * dpi < 1
         assert 0 <= image.height - height / 25.4 * dpi < 1
-        gray = image.convert("L")
+        lines = image.convert("L")
+    assert export_png(
+        assembly,
+        path,
+        viewpoint,
+        up,
+        scale=scale,
+        margin=margin,
+        dpi=dpi,
+        line_color=None,
+    )
+    with Image.open(path) as image:
+        faces = image.convert("L")
 
     def on_an_edge(x: float, y: float) -> bool:
-        return any(
-            gray.getpixel((round(x) + dx, round(y) + dy)) < 90
-            for dx in (-1, 0, 1)
-            for dy in (-1, 0, 1)
-        )
+        # The lines darken a pixel next to the point: a hairline between two
+        # pixels shares its black between them, and a dark face is no line
+        near = [
+            (round(x) + dx, round(y) + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+        ]
+        return any(lines.getpixel(n) < 0.9 * faces.getpixel(n) for n in near)
 
     pixels = scale * dpi / 25.4
     points = [edge.position_at(i / 20) for edge in visible for i in range(21)]
