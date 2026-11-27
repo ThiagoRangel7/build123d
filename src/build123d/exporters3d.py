@@ -901,7 +901,8 @@ def export_png(
 
     Raises:
         ValueError: viewpoint equals look_at, or up is parallel to the view
-        RuntimeError: no display, or the picture could not be drawn or written
+        RuntimeError: no display, or the picture could not be drawn
+        FileNotFoundError: The destination directory does not exist.
 
     Returns:
         bool: success
@@ -920,9 +921,13 @@ def export_png(
         edge_width,
         margin,
     )
-    path = fsdecode(file_path)
-    if not image.Save(TCollection_AsciiString(path)):
-        raise RuntimeError(f"Failed to write PNG file {path}")
+    # OpenCascade picks the format from a file name's extension, so the PNG is
+    # made in memory and then written, whatever the file is called
+    png = BytesIO()
+    if not image.Save(png, TCollection_AsciiString(".png")):
+        raise RuntimeError("OpenCascade could not encode the picture as PNG")
+    with open(fsdecode(file_path), "wb") as file:
+        file.write(png.getvalue())
     return True
 
 
