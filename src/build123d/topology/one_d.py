@@ -839,6 +839,23 @@ def _merge_edges(edges: list[Edge], tolerance: float) -> list[Edge]:
     return merged
 
 
+def _drawing_look_at(shape: Shape, look_at: VectorLike | None) -> Vector:
+    """The point a drawing view is centred on: look_at, or the shape's center"""
+    return Vector(look_at) if look_at else shape.center()
+
+
+def _drawing_frame(viewpoint: VectorLike, up: VectorLike, look_at: Vector) -> gp_Ax2:
+    """The coordinate system a drawing view projects into, which export_png
+    draws in too: its origin at viewpoint, its z axis from look_at towards
+    viewpoint and its y axis towards up. The drawing is in its x and y, with
+    look_at at (0, 0)"""
+    eye = Vector(viewpoint)
+    frame = gp_Ax2()
+    frame.SetAxis(gp_Ax1(eye.to_pnt(), (eye - look_at).normalized().to_dir()))
+    frame.SetYDirection(Vector(up).normalized().to_dir())
+    return frame
+
+
 class Mixin1D(Shape[TOPODS]):
     """Methods to add to the Edge and Wire classes"""
 
@@ -1985,13 +2002,9 @@ class Mixin1D(Shape[TOPODS]):
         hidden_line_removal = HLRBRep_Algo()
         hidden_line_removal.Add(self.wrapped)
 
-        eye = Vector(viewpoint)
-        look_at = Vector(look_at) if look_at else self.center()
-        projection_dir: Vector = (eye - look_at).normalized()
-        up = Vector(up).normalized()
-        camera_coordinate_system = gp_Ax2()
-        camera_coordinate_system.SetAxis(gp_Ax1(eye.to_pnt(), projection_dir.to_dir()))
-        camera_coordinate_system.SetYDirection(up.to_dir())
+        camera_coordinate_system = _drawing_frame(
+            viewpoint, up, _drawing_look_at(self, look_at)
+        )
         projector = (
             HLRAlgo_Projector(camera_coordinate_system, focus)
             if focus

@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import unittest
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryFile
@@ -48,6 +49,7 @@ from build123d.build_common import GridLocations
 from build123d.build_enums import Unit
 from build123d.build_line import BuildLine
 from build123d.build_sketch import BuildSketch
+from build123d.exporters import ExportSVG
 from build123d.exporters3d import (
     export_brep,
     export_gltf,
@@ -521,7 +523,7 @@ def picture(folder: Path, shape, **options) -> Image.Image:
         "viewpoint": (0, -10, 0),
         "look_at": (0, 0, 0),
         "size": (60, 40),
-        "edge_color": None,
+        "line_color": None,
     }
     settings.update(options)
     path = folder / "picture.png"
@@ -566,15 +568,17 @@ def test_export_png_edges(tmp_path):
     """Edges are drawn only when asked for"""
 
     def dark_pixels(image: Image.Image) -> int:
+        # Darker than the red faces and the white background; a hairline
+        # between two rows of pixels shares its black between them
         width, height = image.size
         return sum(
             1
             for x in range(width)
             for y in range(height)
-            if max(image.getpixel((x, y))) < 51
+            if max(image.getpixel((x, y))) < 200
         )
 
-    assert dark_pixels(picture(tmp_path, red_box(), edge_color="black")) > 0
+    assert dark_pixels(picture(tmp_path, red_box(), line_color="black")) > 0
     assert dark_pixels(picture(tmp_path, red_box())) == 0
 
 
@@ -594,13 +598,86 @@ def test_export_png_assemblies(tmp_path):
 
 
 def test_export_png_default_view(tmp_path):
-    """Without a view, the whole shape is in the picture, with nothing cut off"""
-    image = picture(tmp_path, red_box(), viewpoint=None, look_at=None, size=(120, 90))
+    """Without a view, the whole shape is in the picture, in its middle, and the
+    margin keeps it off the border"""
+    image = picture(
+        tmp_path, red_box(), viewpoint=None, look_at=None, size=(120, 90), margin=3
+    )
     width, height = image.size
-    border = {(x, y) for x in range(width) for y in (0, height - 1)}
-    border |= {(x, y) for x in (0, width - 1) for y in range(height)}
-    assert all(min(image.getpixel(point)) > 242 for point in border)
-    assert min(image.getpixel((width // 2, height // 2))) < 128
+    drawn = [
+        (x, y)
+        for x in range(width)
+        for y in range(height)
+        if min(image.getpixel((x, y))) < 243
+    ]
+    columns, rows = [x for x, _ in drawn], [y for _, y in drawn]
+    assert min(columns) > 0 and min(rows) > 0
+    assert abs(min(columns) - (width - 1 - max(columns))) <= 1
+    assert abs(min(rows) - (height - 1 - max(rows))) <= 1
+
+
+def test_export_png_scale(tmp_path):
+    """At a scale, the picture is ExportSVG's page at dpi: a 10 mm cube seen from
+    the front at 254 dpi, 10 pixels a millimetre, takes 100 pixels, plus 0.9 for
+    half the 0.09 mm line on each side, plus the margin, which isn't scaled"""
+    path = tmp_path / "cube.png"
+    for scale, margin, expected in ((1, 0, 101), (2, 0, 201), (1, 1, 121)):
+        export_png(
+            Box(10, 10, 10), path, (0, -100, 0), scale=scale, margin=margin, dpi=254
+        )
+        with Image.open(path) as image:
+            assert image.size == (expected, expected)
+            assert image.info["dpi"] == pytest.approx((254, 254), abs=0.01)
+
+
+@pytest.mark.parametrize(
+    "viewpoint, up",
+    [((100, -80, 60), (0, 0, 1)), ((0, 0, 100), (1, 0, 0))],
+    ids=["wide", "tall"],
+)
+def test_export_png_matches_svg(tmp_path, viewpoint, up):
+    """Given ExportSVG's arguments, the picture is the SVG's page drawn at dpi:
+    the same size on paper, with drawing_view's lines on the picture's edges,
+    the default look_at included"""
+    base = Box(30, 20, 5)
+    base.color = Color("steelblue")
+    block = Pos(5, 3, 7.5) * Box(10, 8, 10)
+    block.color = Color("orange")
+    assembly = Compound(children=[base, block])
+    scale, margin, dpi = 2, 3, 200
+
+    visible, _hidden = assembly.drawing_view(viewpoint, up)
+    drawing = ExportSVG(scale=scale, margin=margin)
+    drawing.add_shape(visible)
+    drawing.write(tmp_path / "view.svg")
+    page = ET.parse(tmp_path / "view.svg").getroot().attrib
+    width, height = (
+        float(page[side].removesuffix("mm")) for side in ("width", "height")
+    )
+    left, top = (float(value) for value in page["viewBox"].split()[:2])
+
+    path = tmp_path / "view.png"
+    assert export_png(
+        assembly, path, viewpoint, up, scale=scale, margin=margin, dpi=dpi
+    )
+    with Image.open(path) as image:
+        assert 0 <= image.width - width / 25.4 * dpi < 1
+        assert 0 <= image.height - height / 25.4 * dpi < 1
+        gray = image.convert("L")
+
+    def on_an_edge(x: float, y: float) -> bool:
+        return any(
+            gray.getpixel((round(x) + dx, round(y) + dy)) < 90
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+        )
+
+    pixels = scale * dpi / 25.4
+    points = [edge.position_at(i / 20) for edge in visible for i in range(21)]
+    on_edges = [
+        on_an_edge((p.X - left) * pixels, (-p.Y - top) * pixels) for p in points
+    ]
+    assert sum(on_edges) / len(on_edges) > 0.95
 
 
 def test_export_png_errors(tmp_path):
@@ -613,6 +690,12 @@ def test_export_png_errors(tmp_path):
         export_png(red_box(), path, viewpoint=(0, 0, 10), up=(0, 0, 1))
     with pytest.raises(ValueError, match="one pixel"):
         export_png(red_box(), path, size=(0, 10))
+    with pytest.raises(ValueError, match="positive"):
+        export_png(red_box(), path, scale=0)
+    with pytest.raises(ValueError, match="positive"):
+        export_png(red_box(), path, dpi=-96)
+    with pytest.raises(ValueError, match="margin"):
+        export_png(red_box(), path, size=(20, 20), margin=10)
     with pytest.raises(ValueError, match="nothing to export"):
         export_png(Compound(), path)
     with pytest.raises(FileNotFoundError, match="missing"):

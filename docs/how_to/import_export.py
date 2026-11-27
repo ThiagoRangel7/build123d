@@ -228,6 +228,14 @@ drawing.write("panel.svg")
 
 assert os.path.getsize("panel.svg") > 0
 
+# [shaded view]
+export_png(
+    panel, "panel_shaded.png", (100, -80, 60), scale=100 / max_dimension, dpi=300
+)
+# [shaded view]
+
+assert os.path.getsize("panel_shaded.png") > 0
+
 # [dxf]
 outline = section(plate, section_by=Plane.XY)  # the plate cut through its middle
 

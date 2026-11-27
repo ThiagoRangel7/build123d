@@ -31,13 +31,16 @@ license:
 
 import ctypes
 import ctypes.util
+import struct
 import sys
 import tempfile
 import threading
 import warnings
 import webbrowser
+import zlib
 from datetime import datetime
 from functools import cache
+from math import ceil
 from io import BytesIO
 from os import PathLike, fsdecode
 from pathlib import Path
@@ -65,6 +68,7 @@ from OCP.Graphic3d import (
 from OCP.IFSelect import IFSelect_ReturnStatus
 from OCP.IGESControl import IGESControl_Controller
 from OCP.Image import Image_AlienPixMap
+from OCP.gp import gp_Ax2, gp_Ax3, gp_Trsf
 from OCP.Interface import Interface_Static
 from OCP.Message import Message, Message_Gravity, Message_ProgressRange
 from OCP.OpenGl import OpenGl_GraphicDriver
@@ -85,6 +89,7 @@ from OCP.TDataStd import TDataStd_Name
 from OCP.TDF import TDF_Label
 from OCP.TDocStd import TDocStd_Document
 from OCP.TopExp import TopExp_Explorer
+from OCP.TopLoc import TopLoc_Location
 from OCP.TopTools import TopTools_FormatVersion
 from OCP.V3d import V3d_Viewer
 from OCP.XCAFApp import XCAFApp_Application
@@ -95,8 +100,18 @@ from threejs_materials import PbrProperties, inject_materials
 
 from build123d.build_constants import UNITS_PER_METER
 from build123d.build_enums import PrecisionMode, Unit
-from build123d.geometry import Color, ColorLike, Location, Vector, VectorLike
+from build123d.exporters import Export2D, _page, unit_conversion_scale
+from build123d.geometry import (
+    TOLERANCE,
+    BoundBox,
+    Color,
+    ColorLike,
+    Location,
+    Vector,
+    VectorLike,
+)
 from build123d.topology import Compound, Curve, Part, Shape, Sketch
+from build123d.topology.one_d import _drawing_frame, _drawing_look_at
 
 
 def _create_xde(
@@ -758,28 +773,38 @@ def _accelerated_opengl() -> bool:  # pragma: darwin cover
     return True
 
 
-def _shaded_image(
+def _with_dpi(png: bytes, dpi: float) -> bytes:
+    """png with its resolution (pHYs) set to dpi, so that it has a size on
+    paper, as an SVG has. The encoder may have written one already, and a PNG
+    holds at most one"""
+    per_metre = round(dpi / 0.0254)
+    data = b"pHYs" + struct.pack(">IIB", per_metre, per_metre, 1)
+    resolution = struct.pack(">I", 9) + data + struct.pack(">I", zlib.crc32(data))
+    chunks, position = [png[:8]], 8
+    while position < len(png):
+        (length,) = struct.unpack(">I", png[position : position + 4])
+        kind, end = png[position + 4 : position + 8], position + 12 + length
+        if kind != b"pHYs":
+            chunks.append(png[position:end])
+        if kind == b"IHDR":
+            chunks.append(resolution)
+        position = end
+    return b"".join(chunks)
+
+
+def _shaded_image(  # pylint: disable=too-many-arguments, too-many-positional-arguments
     to_export: Shape,
-    viewpoint: VectorLike | None,
-    up: VectorLike,
-    look_at: VectorLike | None,
+    frame: gp_Ax2,
+    corner: tuple[float, float],
+    pixels: float,
     size: tuple[int, int],
     background: ColorLike,
-    edge_color: ColorLike | None,
-    edge_width: float,
-    margin: float,
+    line_color: ColorLike | None,
+    line_width: float,
 ) -> Image_AlienPixMap:
-    """Draw a shaded picture of to_export; see export_png"""
-    if look_at is None:
-        look_at = to_export.bounding_box().center()
-    if viewpoint is None:
-        viewpoint = Vector(look_at) + (1, -1, 1)
-    direction = Vector(viewpoint) - Vector(look_at)
-    if direction.length == 0:
-        raise ValueError("viewpoint and look_at must be different points")
-    if direction.cross(Vector(up)).length == 0:
-        raise ValueError("up must not be parallel to the direction of view")
-
+    """Draw a shaded picture of to_export as seen in a drawing view's frame,
+    with the picture's top left corner at corner in the frame's x and y, and
+    pixels pixels per model unit; see export_png"""
     try:
         display = Aspect_DisplayConnection()
     except Aspect_DisplayConnectionDefinitionError as exc:
@@ -811,11 +836,11 @@ def _shaded_image(
     )
     edges = (
         None
-        if edge_color is None
+        if line_color is None
         else Prs3d_LineAspect(
-            Color(edge_color).wrapped.GetRGB(),
+            Color(line_color).wrapped.GetRGB(),
             Aspect_TypeOfLine.Aspect_TOL_SOLID,
-            edge_width,
+            line_width,
         )
     )
 
@@ -840,38 +865,59 @@ def _shaded_image(
             presentation.Attributes().SetFaceBoundaryAspect(edges)
         context.Display(presentation, AIS_DisplayMode.AIS_Shaded.value, -1, False)
 
-    view.SetProj(*direction)
-    view.SetUp(*Vector(up))
-    view.FitAll(margin, False)
+    # The camera looks along the frame's z axis, with its y axis up, at the
+    # middle of the picture, from outside the shape
+    x_dir, y_dir, z_dir = (
+        Vector(direction)
+        for direction in (frame.XDirection(), frame.YDirection(), frame.Direction())
+    )
+    middle = (
+        Vector(frame.Location())
+        + x_dir * (corner[0] + size[0] / pixels / 2)
+        + y_dir * (corner[1] - size[1] / pixels / 2)
+    )
+    box = to_export.bounding_box()
+    eye = middle + z_dir * (box.diagonal + (box.center() - middle).length + 1)
+    camera = view.Camera()
+    camera.SetEyeAndCenter(eye.to_pnt(), middle.to_pnt())
+    camera.SetUp(frame.YDirection())
+    # Graphic3d_Camera's scale is the view's shorter side, in model units
+    camera.SetScale(min(size) / pixels)
     image = Image_AlienPixMap()
     if not view.ToPixMap(image, *size):
         raise RuntimeError("OpenGL could not draw the picture")
     return image
 
 
-def export_png(
+def export_png(  # pylint: disable=too-many-arguments, too-many-positional-arguments, too-many-locals
     to_export: Shape,
     file_path: PathLike | str | bytes,
     viewpoint: VectorLike | None = None,
     up: VectorLike = (0, 0, 1),
     look_at: VectorLike | None = None,
-    size: tuple[int, int] = (1200, 900),
+    unit: Unit = Unit.MM,
+    scale: float = 1,
+    margin: float = 0,
+    fit_to_stroke: bool = True,
+    line_color: ColorLike | None = "black",
+    line_weight: float = Export2D.DEFAULT_LINE_WEIGHT,
+    dpi: float = 96,
+    size: tuple[int, int] | None = None,
     background: ColorLike = "white",
-    edge_color: ColorLike | None = "black",
-    edge_width: float = 1.0,
-    margin: float = 0.05,
 ) -> bool:
     """export_png
 
     Write a shaded picture of a shape or assembly to a PNG file, drawn by
-    OpenCascade's own renderer with OpenGL and nothing shown on screen. The view
-    is orthographic and fitted to the picture; each part of an assembly is drawn
-    at its place in the assembly, in its own color or the one it inherits, with
-    its alpha as transparency. Its faces are matte, so a face that looks
-    straight at the camera keeps its color.
+    OpenCascade's own renderer with OpenGL and nothing shown on screen. Each
+    part of an assembly is drawn at its place in the assembly, in its own color
+    or the one it inherits, with its alpha as transparency. Its faces are matte,
+    so a face that looks straight at the camera keeps its color.
 
-    The camera follows :meth:`~topology.Mixin3D.drawing_view`, so a picture and a
-    line drawing taken with the same arguments match.
+    The picture is the page :class:`~exporters.ExportSVG` writes for the
+    shape's :meth:`~topology.Mixin3D.drawing_view` with the same arguments,
+    drawn at dpi: the same view, scale, margin and size on paper, with the
+    lines on the picture's edges. Given a size instead, the page is scaled to
+    fit in it.
 
     OpenGL draws only with a display: on Linux without one, run under a virtual
     X server, such as with ``xvfb-run``. On macOS, call it from the main thread.
@@ -883,24 +929,34 @@ def export_png(
     Args:
         to_export (Shape): object or assembly
         file_path (Union[PathLike, str, bytes]): PNG file path
-        viewpoint (VectorLike, optional): where the view is taken from.
-            Defaults to None, the point (1, -1, 1) from look_at.
-        up (VectorLike, optional): direction of the picture's y axis.
-            Defaults to (0, 0, 1).
-        look_at (VectorLike, optional): point the view is aimed at.
-            Defaults to None (center of shape).
-        size (tuple[int, int], optional): picture width and height in pixels.
-            Defaults to (1200, 900).
-        background (ColorLike, optional): background color. Defaults to "white".
-        edge_color (ColorLike, optional): color of the edges between faces, or
+        viewpoint (VectorLike, optional): where the view is taken from, as in
+            drawing_view. Defaults to None, the point (1, -1, 1) from look_at.
+        up (VectorLike, optional): direction of the picture's y axis, as in
+            drawing_view. Defaults to (0, 0, 1).
+        look_at (VectorLike, optional): point the view is centred on, as in
+            drawing_view. Defaults to None (center of shape).
+        unit (Unit, optional): unit of the page, as in ExportSVG.
+            Defaults to Unit.MM.
+        scale (float, optional): page units per model unit, as in ExportSVG.
+            Defaults to 1.
+        margin (float, optional): empty border around the shape, in page
+            units, as in ExportSVG. Defaults to 0.
+        fit_to_stroke (bool, optional): whether the border also fits half the
+            line weight, as in ExportSVG. Defaults to True.
+        line_color (ColorLike, optional): color of the edges between faces, or
             None to leave them out. Defaults to "black".
-        edge_width (float, optional): width of the edges in pixels.
-            Defaults to 1.0.
-        margin (float, optional): empty border around the shape, as a fraction
-            of the picture. Defaults to 0.05.
+        line_weight (float, optional): width of the edges in millimetres, as in
+            ExportSVG. Defaults to Export2D.DEFAULT_LINE_WEIGHT.
+        dpi (float, optional): pixels per inch of the page, which the PNG
+            records. Defaults to 96, at which browsers show an SVG.
+        size (tuple[int, int], optional): picture width and height in pixels,
+            the page scaled to fit in them, in their middle; scale is then not
+            used. Defaults to None, the page's size at dpi.
+        background (ColorLike, optional): background color. Defaults to "white".
 
     Raises:
-        ValueError: viewpoint equals look_at, or up is parallel to the view
+        ValueError: viewpoint equals look_at, up is parallel to the view, scale
+            or dpi isn't positive, or size has no room inside the margin
         RuntimeError: no display, or the picture could not be drawn
         FileNotFoundError: The destination directory does not exist.
 
@@ -908,18 +964,59 @@ def export_png(
         bool: success
     """
     _nothing_to_export(to_export)
-    if min(size) < 1:
+    if scale <= 0 or dpi <= 0:
+        raise ValueError(f"scale and dpi must be positive, not {scale} and {dpi}")
+    if size is not None and min(size) < 1:
         raise ValueError(f"size must be at least one pixel each way, not {size}")
+    look_at = _drawing_look_at(to_export, look_at)
+    if viewpoint is None:
+        viewpoint = look_at + (1, -1, 1)
+    direction = Vector(viewpoint) - look_at
+    if direction.length < TOLERANCE:
+        raise ValueError("viewpoint and look_at must be different points")
+    if direction.normalized().cross(Vector(up).normalized()).length < TOLERANCE:
+        raise ValueError("up must not be parallel to the direction of view")
+    frame = _drawing_frame(viewpoint, up, look_at)
+
+    # The shape's bounds in drawing_view's coordinates, as ExportSVG gets them
+    # from its lines
+    to_frame = gp_Trsf()
+    to_frame.SetTransformation(gp_Ax3(frame))
+    bounds = BoundBox(to_export.wrapped.Moved(TopLoc_Location(to_frame)))
+    stroke = line_weight if fit_to_stroke else 0
+    pixels_per_page_unit = dpi / unit_conversion_scale(Unit.IN, unit)
+    if size is not None:
+        # The largest scale whose page fits in size
+        room = [side / pixels_per_page_unit - 2 * margin - stroke for side in size]
+        if min(room) <= 0:
+            raise ValueError(f"a margin of {margin} leaves no room in {size} pixels")
+        extents = (bounds.size.X, bounds.size.Y)
+        scale = min((r / e for r, e in zip(room, extents) if e > 0), default=scale)
+    left, top, width, height = _page(bounds, scale, margin, stroke)
+    pixels = scale * pixels_per_page_unit
+    if size is None:
+        size = (
+            max(1, ceil(round(width * pixels, 6))),
+            max(1, ceil(round(height * pixels, 6))),
+        )
+        corner = (left, top)
+    else:
+        corner = (
+            left + (width - size[0] / pixels) / 2,
+            top - (height - size[1] / pixels) / 2,
+        )
+
     image = _shaded_image(
         to_export,
-        viewpoint,
-        up,
-        look_at,
+        frame,
+        corner,
+        pixels,
         size,
         background,
-        edge_color,
-        edge_width,
-        margin,
+        line_color,
+        # line_weight is in millimetres, as in ExportSVG; thinner than a pixel,
+        # a line would fade, so it is drawn a pixel wide, as a hairline
+        max(1.0, line_weight * dpi / 25.4),
     )
     # OpenCascade picks the format from a file name's extension, so the PNG is
     # made in memory and then written, whatever the file is called
@@ -927,7 +1024,7 @@ def export_png(
     if not image.Save(png, TCollection_AsciiString(".png")):
         raise RuntimeError("OpenCascade could not encode the picture as PNG")
     with open(fsdecode(file_path), "wb") as file:
-        file.write(png.getvalue())
+        file.write(_with_dpi(png.getvalue(), dpi))
     return True
 
 

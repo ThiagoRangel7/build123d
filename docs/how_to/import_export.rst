@@ -266,10 +266,10 @@ Make a picture
 assembly with OpenCascade's own renderer and saves it as PNG, without
 opening a viewer. The camera works as in
 :meth:`~topology.Mixin3D.drawing_view`: ``viewpoint`` is where the picture
-is taken from, ``look_at`` where it points and ``up`` which way is up, so
-a picture and a line drawing made with the same arguments match, as the
-drawing below does. Each part keeps its colour, and a colour's alpha makes
-it see-through.
+is taken from, ``look_at`` where it points and ``up`` which way is up. Each
+part keeps its colour, and a colour's alpha makes it see-through. With
+``size``, the view is fitted into that many pixels; without it, the picture
+is drawn at a scale, as a drawing is in the next section.
 
 The picture is drawn with OpenGL, which needs a display. On a Linux server
 or in CI without one, run the script under a virtual X server, such as
@@ -302,6 +302,18 @@ types, add shapes to the layers, and write the file.
     :language: build123d
     :start-after: [svg]
     :end-before: [svg]
+
+A shaded picture of the same view takes the same arguments:
+``drawing_view``'s camera and ``ExportSVG``'s ``unit``, ``scale``,
+``margin``, ``fit_to_stroke`` and ``line_weight``, plus ``dpi``.
+:func:`~exporters3d.export_png` then draws the page ``ExportSVG`` writes,
+at that resolution, which the PNG records, so the two are the same size on
+paper and the drawing's lines lie on the picture's edges.
+
+.. literalinclude:: /how_to/import_export.py
+    :language: build123d
+    :start-after: [shaded view]
+    :end-before: [shaded view]
 
 ``ExportSVG`` accepts the standard ``ColorLike`` interface for
 layer fill and line colours. When a layer colour is omitted, a Face colour is used
