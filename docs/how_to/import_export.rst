@@ -27,6 +27,8 @@ pass the builder's result: ``export_step(my_part.part, "part.step")``.
       - ``export_stl``, or ``Mesher`` for 3MF
     * - show a model on the web or in a renderer
       - ``export_gltf``, ``export_obj``
+    * - make a picture of a model
+      - ``export_png``
     * - make a 2D drawing
       - ``ExportSVG``, ``ExportDXF``
     * - bring in a mesh
@@ -87,6 +89,12 @@ Choose a format
       - no
       - no
       - :func:`~exporters3d.export_obj` (export only)
+    * - PNG
+      - a shaded picture
+      - yes
+      - no
+      - no
+      - :func:`~exporters3d.export_png` (export only)
     * - SVG
       - 2D lines and filled shapes
       - yes
@@ -246,6 +254,32 @@ exported UV atlas with a separate texture-painting, baking, or material-authorin
 workflow.
 
 *********************
+Make a picture
+*********************
+
+.. literalinclude:: /how_to/import_export.py
+    :language: build123d
+    :start-after: [png]
+    :end-before: [png]
+
+:func:`~exporters3d.export_png` draws a shaded picture of a shape or
+assembly with OpenCascade's own renderer and saves it as PNG, without
+opening a viewer. The camera works as in
+:meth:`~topology.Mixin3D.drawing_view`: ``viewpoint`` is where the picture
+is taken from, ``look_at`` where it points and ``up`` which way is up. Each
+part keeps its colour, and a colour's alpha makes it see-through. With
+``size``, the view is fitted into that many pixels; without it, the picture
+is drawn at a scale, as a drawing is in the next section.
+
+The picture is drawn with OpenGL, which needs a display. On a Linux server
+or in CI without one, run the script under a virtual X server, such as
+``xvfb-run python my_model.py``. When several processes draw at once on one
+virtual X server, such as parallel test workers, start it with ``-noreset``,
+as in ``xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" pytest -n auto``;
+otherwise it resets whenever its last client disconnects, and a process
+connecting at that moment fails. On macOS, call it from the main thread.
+
+*********************
 Make a 2D drawing
 *********************
 
@@ -268,6 +302,18 @@ types, add shapes to the layers, and write the file.
     :language: build123d
     :start-after: [svg]
     :end-before: [svg]
+
+A shaded picture of the same view takes the same arguments:
+``drawing_view``'s camera and ``ExportSVG``'s ``unit``, ``scale``,
+``margin``, ``fit_to_stroke`` and ``line_weight``, plus ``dpi``.
+:func:`~exporters3d.export_png` then draws the page ``ExportSVG`` writes,
+at that resolution, which the PNG records, so the two are the same size on
+paper and the drawing's lines lie on the picture's edges.
+
+.. literalinclude:: /how_to/import_export.py
+    :language: build123d
+    :start-after: [shaded view]
+    :end-before: [shaded view]
 
 ``ExportSVG`` accepts the standard ``ColorLike`` interface for
 layer fill and line colours. When a layer colour is omitted, a Face colour is used

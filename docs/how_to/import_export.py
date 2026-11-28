@@ -201,6 +201,16 @@ export_obj(plate, "plate.obj", atlas_gutter=0.002)
 assert os.path.getsize("plate.obj") > 0
 
 # ---------------------------------------------------------------------------
+# a shaded picture: PNG
+# ---------------------------------------------------------------------------
+
+# [png]
+export_png(panel, "panel.png", viewpoint=(100, -80, 60), size=(800, 600))
+# [png]
+
+assert os.path.getsize("panel.png") > 0
+
+# ---------------------------------------------------------------------------
 # a 2D drawing: SVG and DXF
 # ---------------------------------------------------------------------------
 
@@ -217,6 +227,14 @@ drawing.write("panel.svg")
 # [svg]
 
 assert os.path.getsize("panel.svg") > 0
+
+# [shaded view]
+export_png(
+    panel, "panel_shaded.png", (100, -80, 60), scale=100 / max_dimension, dpi=300
+)
+# [shaded view]
+
+assert os.path.getsize("panel_shaded.png") > 0
 
 # [dxf]
 outline = section(plate, section_by=Plane.XY)  # the plate cut through its middle

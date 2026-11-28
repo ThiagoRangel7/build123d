@@ -32,5 +32,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
           optional-dependencies: "development"
       - name: test
+        if: runner.os != 'Linux'
         run: |
           python -m pytest -n auto --benchmark-disable
+      - name: test
+        if: runner.os == 'Linux'
+        # export_png draws with OpenGL, which needs an X server. -noreset stops it
+        # from resetting whenever its last client disconnects, which would drop
+        # another test worker connecting at that moment.
+        run: |
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" python -m pytest -n auto --benchmark-disable

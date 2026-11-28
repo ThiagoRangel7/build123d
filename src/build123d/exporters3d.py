@@ -29,10 +29,18 @@ license:
 # pylint has trouble with the OCP imports
 # pylint: disable=no-name-in-module, import-error
 
+import ctypes
+import ctypes.util
+import struct
+import sys
 import tempfile
+import threading
 import warnings
 import webbrowser
+import zlib
 from datetime import datetime
+from functools import cache
+from math import ceil
 from io import BytesIO
 from os import PathLike, fsdecode
 from pathlib import Path
@@ -41,14 +49,30 @@ from typing import BinaryIO, cast
 import OCP.TopAbs as ta
 import requests
 from anytree import PreOrderIter
+from OCP.AIS import AIS_DisplayMode, AIS_InteractiveContext, AIS_Shape
 from OCP.APIHeaderSection import APIHeaderSection_MakeHeader
+from OCP.Aspect import (
+    Aspect_DisplayConnection,
+    Aspect_DisplayConnectionDefinitionError,
+    Aspect_TypeOfLine,
+    Aspect_Window,
+)
 from OCP.BinTools import BinTools, BinTools_FormatVersion
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepTools import BRepTools
+from OCP.Graphic3d import (
+    Graphic3d_Camera,
+    Graphic3d_MaterialAspect,
+    Graphic3d_NameOfMaterial,
+)
 from OCP.IFSelect import IFSelect_ReturnStatus
 from OCP.IGESControl import IGESControl_Controller
+from OCP.Image import Image_AlienPixMap
+from OCP.gp import gp_Ax2, gp_Ax3, gp_Trsf
 from OCP.Interface import Interface_Static
 from OCP.Message import Message, Message_Gravity, Message_ProgressRange
+from OCP.OpenGl import OpenGl_GraphicDriver
+from OCP.Prs3d import Prs3d_LineAspect
 from OCP.RWGltf import RWGltf_CafWriter
 from OCP.STEPCAFControl import STEPCAFControl_Controller, STEPCAFControl_Writer
 from OCP.STEPControl import STEPControl_Controller, STEPControl_StepModelType
@@ -65,7 +89,9 @@ from OCP.TDataStd import TDataStd_Name
 from OCP.TDF import TDF_Label
 from OCP.TDocStd import TDocStd_Document
 from OCP.TopExp import TopExp_Explorer
+from OCP.TopLoc import TopLoc_Location
 from OCP.TopTools import TopTools_FormatVersion
+from OCP.V3d import V3d_Viewer
 from OCP.XCAFApp import XCAFApp_Application
 from OCP.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
 from OCP.XSControl import XSControl_WorkSession
@@ -74,8 +100,18 @@ from threejs_materials import PbrProperties, inject_materials
 
 from build123d.build_constants import UNITS_PER_METER
 from build123d.build_enums import PrecisionMode, Unit
-from build123d.geometry import Location
+from build123d.exporters import Export2D, _page, unit_conversion_scale
+from build123d.geometry import (
+    TOLERANCE,
+    BoundBox,
+    Color,
+    ColorLike,
+    Location,
+    Vector,
+    VectorLike,
+)
 from build123d.topology import Compound, Curve, Part, Shape, Sketch
+from build123d.topology.one_d import _drawing_frame, _drawing_look_at
 
 
 def _create_xde(
@@ -648,6 +684,347 @@ def export_obj(
         # BytesIO / BinaryIO stream
         file_path.write(content.encode("utf-8"))
 
+    return True
+
+
+# The color of shapes without one in export_png, as in OCP CAD Viewer
+DEFAULT_PNG_COLOR = Color(0xE8B024)
+
+
+@cache
+def _window_class():  # pragma: win32 cover
+    """Windows registers a window class once per process. None selects the
+    default window procedure"""
+    # pylint: disable=import-outside-toplevel
+    from OCP.WNT import WNT_WClass
+
+    cs_vredraw, cs_hredraw = 0x0001, 0x0002
+    return WNT_WClass(
+        TCollection_AsciiString("build123d"), None, cs_vredraw | cs_hredraw
+    )
+
+
+@cache
+def _start_ns_application() -> None:  # pragma: darwin cover
+    """A Cocoa window needs the application object, which Python doesn't make;
+    an application that has one already keeps it"""
+    objc = ctypes.cdll.LoadLibrary(
+        ctypes.util.find_library("objc") or "/usr/lib/libobjc.dylib"
+    )
+    ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+    objc.objc_getClass.restype = ctypes.c_void_p
+    objc.sel_registerName.restype = ctypes.c_void_p
+    objc.objc_msgSend.restype = ctypes.c_void_p
+    objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    objc.objc_msgSend(
+        objc.objc_getClass(b"NSApplication"),
+        objc.sel_registerName(b"sharedApplication"),
+    )
+
+
+def _offscreen_window(display: Aspect_DisplayConnection) -> Aspect_Window:
+    """A window for OpenGL that is never shown
+
+    OpenGL needs a window to draw for, but ``V3d_View.ToPixMap`` draws into a
+    buffer of its own of any size, so the window stays hidden and small, as in
+    OpenCascade's own offscreen viewer (``vinit -virtual``).
+    """
+    # The window classes exist only in the OCP build for their own system
+    # pylint: disable=import-outside-toplevel
+    window: Aspect_Window
+    if sys.platform == "win32":  # pragma: win32 cover
+        from OCP.WNT import WNT_Window
+
+        ws_popup = 0x80000000
+        window = WNT_Window("build123d", _window_class(), ws_popup, 0, 0, 64, 64)
+    elif sys.platform == "darwin":  # pragma: darwin cover
+        # A window without a native view (Aspect_NeutralWindow) only works with
+        # a graphics device, not with Apple's software renderer
+        from OCP.Cocoa import Cocoa_Window
+
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("On macOS, export_png works only in the main thread")
+        _start_ns_application()
+        window = Cocoa_Window("build123d", 0, 0, 64, 64)
+    else:  # pragma: linux cover
+        from OCP.Xw import Xw_Window
+
+        window = Xw_Window(display, "build123d", 0, 0, 64, 64)
+    window.SetVirtual(True)
+    return window
+
+
+@cache
+def _accelerated_opengl() -> bool:  # pragma: darwin cover
+    """Whether this Mac has a graphics device for OpenGL; a virtual machine may
+    have none, and then only Apple's software renderer draws"""
+    opengl = ctypes.cdll.LoadLibrary(
+        "/System/Library/Frameworks/OpenGL.framework/OpenGL"
+    )
+    accelerated = 73  # kCGLPFAAccelerated
+    attributes = (ctypes.c_int * 2)(accelerated, 0)
+    pixel_format, count = ctypes.c_void_p(None), ctypes.c_int(0)
+    opengl.CGLChoosePixelFormat(
+        attributes, ctypes.byref(pixel_format), ctypes.byref(count)
+    )
+    if not pixel_format.value:
+        return False
+    opengl.CGLReleasePixelFormat(pixel_format)
+    return True
+
+
+def _with_dpi(png: bytes, dpi: float) -> bytes:
+    """png with its resolution (pHYs) set to dpi, so that it has a size on
+    paper, as an SVG has. The encoder may have written one already, and a PNG
+    holds at most one"""
+    per_metre = round(dpi / 0.0254)
+    data = b"pHYs" + struct.pack(">IIB", per_metre, per_metre, 1)
+    resolution = struct.pack(">I", 9) + data + struct.pack(">I", zlib.crc32(data))
+    chunks, position = [png[:8]], 8
+    while position < len(png):
+        (length,) = struct.unpack(">I", png[position : position + 4])
+        kind, end = png[position + 4 : position + 8], position + 12 + length
+        if kind != b"pHYs":
+            chunks.append(png[position:end])
+        if kind == b"IHDR":
+            chunks.append(resolution)
+        position = end
+    return b"".join(chunks)
+
+
+def _shaded_image(  # pylint: disable=too-many-arguments, too-many-positional-arguments
+    to_export: Shape,
+    frame: gp_Ax2,
+    corner: tuple[float, float],
+    pixels: float,
+    size: tuple[int, int],
+    background: ColorLike,
+    line_color: ColorLike | None,
+    line_width: float,
+) -> Image_AlienPixMap:
+    """Draw a shaded picture of to_export as seen in a drawing view's frame,
+    with the picture's top left corner at corner in the frame's x and y, and
+    pixels pixels per model unit; see export_png"""
+    try:
+        display = Aspect_DisplayConnection()
+    except Aspect_DisplayConnectionDefinitionError as exc:
+        raise RuntimeError(
+            "export_png needs a display to draw with OpenGL. On Linux without "
+            "one, run under a virtual X server, such as with xvfb-run"
+        ) from exc
+    driver = OpenGl_GraphicDriver(display, False)
+    if sys.platform == "darwin":  # pragma: darwin cover
+        # Chosen before any view is made: OpenCascade crashes when it removes
+        # a view whose OpenGL context could not be made
+        driver.ChangeOptions().contextNoAccel = not _accelerated_opengl()
+    viewer = V3d_Viewer(driver)
+    viewer.SetDefaultLights()
+    viewer.SetLightOn()
+    context = AIS_InteractiveContext(viewer)
+    view = viewer.CreateView()
+    view.SetWindow(_offscreen_window(display))
+    view.SetBackgroundColor(Color(background).wrapped.GetRGB())
+    view.Camera().SetProjectionType(
+        Graphic3d_Camera.Projection_e.Projection_Orthographic
+    )
+    view.ChangeRenderingParams().NbMsaaSamples = 8
+
+    # OpenCascade's default material is shiny: lit from the camera, a face that
+    # looks straight at it would come out white
+    material = Graphic3d_MaterialAspect(
+        Graphic3d_NameOfMaterial.Graphic3d_NameOfMaterial_Plastered
+    )
+    edges = (
+        None
+        if line_color is None
+        else Prs3d_LineAspect(
+            Color(line_color).wrapped.GetRGB(),
+            Aspect_TypeOfLine.Aspect_TOL_SOLID,
+            line_width,
+        )
+    )
+
+    # Each leaf at its place in to_export, which is placed as its bounding box
+    # and export_step place it, whatever assembly it may be part of
+    nodes: list[tuple[Shape, Location]] = [(to_export, Location())]
+    while nodes:
+        node, location = nodes.pop()
+        if node.is_empty:  # nothing to draw, and no location
+            continue
+        location = location * node.location
+        if node.children:
+            nodes.extend((child, location) for child in node.children)
+            continue
+        presentation = AIS_Shape(node.wrapped.Located(location.wrapped))
+        presentation.SetMaterial(material)
+        color = DEFAULT_PNG_COLOR if node.color is None else node.color
+        presentation.SetColor(color.wrapped.GetRGB())
+        presentation.SetTransparency(1 - color.wrapped.Alpha())
+        if edges is not None:
+            presentation.Attributes().SetFaceBoundaryDraw(True)
+            presentation.Attributes().SetFaceBoundaryAspect(edges)
+        context.Display(presentation, AIS_DisplayMode.AIS_Shaded.value, -1, False)
+
+    # The camera looks along the frame's z axis, with its y axis up, at the
+    # middle of the picture, from outside the shape
+    x_dir, y_dir, z_dir = (
+        Vector(direction)
+        for direction in (frame.XDirection(), frame.YDirection(), frame.Direction())
+    )
+    middle = (
+        Vector(frame.Location())
+        + x_dir * (corner[0] + size[0] / pixels / 2)
+        + y_dir * (corner[1] - size[1] / pixels / 2)
+    )
+    box = to_export.bounding_box()
+    eye = middle + z_dir * (box.diagonal + (box.center() - middle).length + 1)
+    camera = view.Camera()
+    camera.SetEyeAndCenter(eye.to_pnt(), middle.to_pnt())
+    camera.SetUp(frame.YDirection())
+    # Graphic3d_Camera's scale is the view's shorter side, in model units
+    camera.SetScale(min(size) / pixels)
+    image = Image_AlienPixMap()
+    if not view.ToPixMap(image, *size):
+        raise RuntimeError("OpenGL could not draw the picture")
+    return image
+
+
+def export_png(  # pylint: disable=too-many-arguments, too-many-positional-arguments, too-many-locals
+    to_export: Shape,
+    file_path: PathLike | str | bytes,
+    viewpoint: VectorLike | None = None,
+    up: VectorLike = (0, 0, 1),
+    look_at: VectorLike | None = None,
+    unit: Unit = Unit.MM,
+    scale: float = 1,
+    margin: float = 0,
+    fit_to_stroke: bool = True,
+    line_color: ColorLike | None = "black",
+    line_weight: float = Export2D.DEFAULT_LINE_WEIGHT,
+    dpi: float = 96,
+    size: tuple[int, int] | None = None,
+    background: ColorLike = "white",
+) -> bool:
+    """export_png
+
+    Write a shaded picture of a shape or assembly to a PNG file, drawn by
+    OpenCascade's own renderer with OpenGL and nothing shown on screen. Each
+    part of an assembly is drawn at its place in the assembly, in its own color
+    or the one it inherits, with its alpha as transparency. Its faces are matte,
+    so a face that looks straight at the camera keeps its color.
+
+    The picture is the page :class:`~exporters.ExportSVG` writes for the
+    shape's :meth:`~topology.Mixin3D.drawing_view` with the same arguments,
+    drawn at dpi: the same view, scale, margin and size on paper, with the
+    lines on the picture's edges. Given a size instead, the page is scaled to
+    fit in it.
+
+    OpenGL draws only with a display: on Linux without one, run under a virtual
+    X server, such as with ``xvfb-run``. On macOS, call it from the main thread.
+    Without a graphics card, OpenGL falls back to a software renderer: Mesa's
+    on Linux and Apple's on macOS draw the same picture, while Microsoft's
+    OpenGL 1.1 on Windows draws the same shapes with simpler shading and no
+    antialiasing.
+
+    Args:
+        to_export (Shape): object or assembly
+        file_path (Union[PathLike, str, bytes]): PNG file path
+        viewpoint (VectorLike, optional): where the view is taken from, as in
+            drawing_view. Defaults to None, the point (1, -1, 1) from look_at.
+        up (VectorLike, optional): direction of the picture's y axis, as in
+            drawing_view. Defaults to (0, 0, 1).
+        look_at (VectorLike, optional): point the view is centred on, as in
+            drawing_view. Defaults to None (center of shape).
+        unit (Unit, optional): unit of the page, as in ExportSVG.
+            Defaults to Unit.MM.
+        scale (float, optional): page units per model unit, as in ExportSVG.
+            Defaults to 1.
+        margin (float, optional): empty border around the shape, in page
+            units, as in ExportSVG. Defaults to 0.
+        fit_to_stroke (bool, optional): whether the border also fits half the
+            line weight, as in ExportSVG. Defaults to True.
+        line_color (ColorLike, optional): color of the edges between faces, or
+            None to leave them out. Defaults to "black".
+        line_weight (float, optional): width of the edges in millimetres, as in
+            ExportSVG. Defaults to Export2D.DEFAULT_LINE_WEIGHT.
+        dpi (float, optional): pixels per inch of the page, which the PNG
+            records. Defaults to 96, at which browsers show an SVG.
+        size (tuple[int, int], optional): picture width and height in pixels,
+            the page scaled to fit in them, in their middle; scale is then not
+            used. Defaults to None, the page's size at dpi.
+        background (ColorLike, optional): background color. Defaults to "white".
+
+    Raises:
+        ValueError: viewpoint equals look_at, up is parallel to the view, scale
+            or dpi isn't positive, or size has no room inside the margin
+        RuntimeError: no display, or the picture could not be drawn
+        FileNotFoundError: The destination directory does not exist.
+
+    Returns:
+        bool: success
+    """
+    _nothing_to_export(to_export)
+    if scale <= 0 or dpi <= 0:
+        raise ValueError(f"scale and dpi must be positive, not {scale} and {dpi}")
+    if size is not None and min(size) < 1:
+        raise ValueError(f"size must be at least one pixel each way, not {size}")
+    look_at = _drawing_look_at(to_export, look_at)
+    if viewpoint is None:
+        viewpoint = look_at + (1, -1, 1)
+    direction = Vector(viewpoint) - look_at
+    if direction.length < TOLERANCE:
+        raise ValueError("viewpoint and look_at must be different points")
+    if direction.normalized().cross(Vector(up).normalized()).length < TOLERANCE:
+        raise ValueError("up must not be parallel to the direction of view")
+    frame = _drawing_frame(viewpoint, up, look_at)
+
+    # The shape's bounds in drawing_view's coordinates, as ExportSVG gets them
+    # from its lines
+    to_frame = gp_Trsf()
+    to_frame.SetTransformation(gp_Ax3(frame))
+    bounds = BoundBox(to_export.wrapped.Moved(TopLoc_Location(to_frame)))
+    stroke = line_weight if fit_to_stroke else 0
+    pixels_per_page_unit = dpi / unit_conversion_scale(Unit.IN, unit)
+    if size is not None:
+        # The largest scale whose page fits in size
+        room = [side / pixels_per_page_unit - 2 * margin - stroke for side in size]
+        if min(room) <= 0:
+            raise ValueError(f"a margin of {margin} leaves no room in {size} pixels")
+        extents = (bounds.size.X, bounds.size.Y)
+        scale = min((r / e for r, e in zip(room, extents) if e > 0), default=scale)
+    left, top, width, height = _page(bounds, scale, margin, stroke)
+    pixels = scale * pixels_per_page_unit
+    if size is None:
+        size = (
+            max(1, ceil(round(width * pixels, 6))),
+            max(1, ceil(round(height * pixels, 6))),
+        )
+        corner = (left, top)
+    else:
+        corner = (
+            left + (width - size[0] / pixels) / 2,
+            top - (height - size[1] / pixels) / 2,
+        )
+
+    image = _shaded_image(
+        to_export,
+        frame,
+        corner,
+        pixels,
+        size,
+        background,
+        line_color,
+        # line_weight is in millimetres, as in ExportSVG; thinner than a pixel,
+        # a line would fade, so it is drawn a pixel wide, as a hairline
+        max(1.0, line_weight * dpi / 25.4),
+    )
+    # OpenCascade picks the format from a file name's extension, so the PNG is
+    # made in memory and then written, whatever the file is called
+    png = BytesIO()
+    if not image.Save(png, TCollection_AsciiString(".png")):
+        raise RuntimeError("OpenCascade could not encode the picture as PNG")
+    with open(fsdecode(file_path), "wb") as file:
+        file.write(_with_dpi(png.getvalue(), dpi))
     return True
 
 

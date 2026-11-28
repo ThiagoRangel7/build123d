@@ -266,6 +266,31 @@ def unit_conversion_scale(from_unit: Unit, to_unit: Unit) -> float:
     return result
 
 
+def _page(
+    bounds: BoundBox, scale: float, margin: float, line_weight: float
+) -> tuple[float, float, float, float]:
+    """The page ExportSVG writes around bounds, which export_png draws too
+
+    Args:
+        bounds (BoundBox): the drawing's bounds, in model units
+        scale (float): page units per model unit
+        margin (float): empty border, in page units
+        line_weight (float): the widest line, half of which the border also
+            fits; 0 to fit the lines' centres
+
+    Returns:
+        tuple[float, float, float, float]: the page's left, top (largest y),
+        width and height, in model units
+    """
+    view_margin = (margin + line_weight / 2) / scale
+    return (
+        bounds.min.X - view_margin,
+        bounds.max.Y + view_margin,
+        bounds.size.X + 2 * view_margin,
+        bounds.size.Y + 2 * view_margin,
+    )
+
+
 # ---------------------------------------------------------------------------
 #
 # ---------------------------------------------------------------------------
@@ -1623,15 +1648,16 @@ class ExportSVG(Export2D):
         bb = self._bounds
         if bb is None:
             raise ValueError("No shapes to export.")
-        doc_margin = self.margin
-        if self.fit_to_stroke:
-            max_line_weight = max(l.line_weight for l in self._layers.values())
-            doc_margin += max_line_weight / 2
-        view_margin = doc_margin / self.scale
-        view_left = round(+bb.min.X - view_margin, self.precision)
-        view_top = round(-bb.max.Y - view_margin, self.precision)
-        view_width = round(bb.size.X + 2 * view_margin, self.precision)
-        view_height = round(bb.size.Y + 2 * view_margin, self.precision)
+        max_line_weight = (
+            max(l.line_weight for l in self._layers.values())
+            if self.fit_to_stroke
+            else 0
+        )
+        left, top, width, height = _page(bb, self.scale, self.margin, max_line_weight)
+        view_left = round(left, self.precision)
+        view_top = round(-top, self.precision)
+        view_width = round(width, self.precision)
+        view_height = round(height, self.precision)
         view_box = [str(f) for f in [view_left, view_top, view_width, view_height]]
         doc_width = round(view_width * self.scale, self.precision)
         doc_height = round(view_height * self.scale, self.precision)

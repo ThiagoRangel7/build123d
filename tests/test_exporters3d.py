@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import unittest
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryFile
@@ -42,20 +43,23 @@ import pytest
 import requests
 from OCP.Standard import Standard_Failure
 from OCP.XCAFApp import XCAFApp_Application
+from PIL import Image
 
 from build123d.build_common import GridLocations
 from build123d.build_enums import Unit
 from build123d.build_line import BuildLine
 from build123d.build_sketch import BuildSketch
+from build123d.exporters import ExportSVG
 from build123d.exporters3d import (
     export_brep,
     export_gltf,
     export_obj,
     export_step,
     export_stl,
+    export_png,
     export_to_pcbway,
 )
-from build123d.geometry import Color, Pos, Vector, VectorLike
+from build123d.geometry import Color, Location, Pos, Vector, VectorLike
 from build123d.objects_curve import Line
 from build123d.objects_part import Box, Cone, Cylinder, Sphere
 from build123d.objects_sketch import Circle, Rectangle
@@ -469,7 +473,7 @@ def test_exports_do_not_leak_open_xcaf_documents(tmp_path):
     "format", (Path, os.fsencode, os.fsdecode), ids=["path", "bytes", "str"]
 )
 @pytest.mark.parametrize(
-    "exporter", (export_gltf, export_stl, export_step, export_brep)
+    "exporter", (export_gltf, export_stl, export_step, export_brep, export_png)
 )
 def test_pathlike_exporters(tmp_path, format, exporter):
     path = format(tmp_path / "file")
@@ -510,6 +514,212 @@ def test_exporters_to_binary_fileobj(exporter):
 def test_exporters_to_stdout(exporter):
     box = Box(1, 1, 1).locate(Pos(-1, -2, -3))
     exporter(box, sys.stdout.buffer)
+
+
+def picture(folder: Path, shape, **options) -> Image.Image:
+    """A small picture of shape from the front, without edges, on white,
+    written by export_png and read back"""
+    settings = {
+        "viewpoint": (0, -10, 0),
+        "look_at": (0, 0, 0),
+        "size": (60, 40),
+        "line_color": None,
+    }
+    settings.update(options)
+    path = folder / "picture.png"
+    assert export_png(shape, path, **settings)
+    with Image.open(path) as image:
+        return image.convert("RGB")
+
+
+def red_box(alpha: float = 1.0) -> Box:
+    box = Box(2, 1, 1)
+    box.color = Color(1, 0, 0, alpha)
+    return box
+
+
+def test_export_png(tmp_path):
+    """A PNG of the requested size, whatever the file's name says"""
+    path = tmp_path / "box.jpg"
+    assert export_png(Box(1, 2, 3), path, size=(120, 90))
+    with Image.open(path) as image:
+        assert (image.format, image.size) == ("PNG", (120, 90))
+
+
+def test_export_png_colors(tmp_path):
+    """A part in its own color or the default one, on the background color,
+    and as see-through as its alpha says"""
+    image = picture(tmp_path, red_box())
+    red, green, blue = image.getpixel((30, 20))
+    assert red > 100 and green < red / 2 and blue < red / 2
+    assert min(image.getpixel((0, 0))) > 242  # white background
+
+    on_black = picture(tmp_path, red_box(), background="black")
+    assert max(on_black.getpixel((0, 0))) < 13
+
+    default = picture(tmp_path, Box(2, 1, 1)).getpixel((30, 20))
+    assert default[0] > default[1] > default[2]  # yellow, as in OCP CAD Viewer
+
+    clear = picture(tmp_path, red_box(alpha=0.3)).getpixel((30, 20))
+    assert clear[1] > green + 25  # the white background shows through
+
+
+def test_export_png_edges(tmp_path):
+    """Edges are drawn only when asked for"""
+
+    def dark_pixels(image: Image.Image) -> int:
+        # Darker than the red faces and the white background; a hairline
+        # between two rows of pixels shares its black between them
+        width, height = image.size
+        return sum(
+            1
+            for x in range(width)
+            for y in range(height)
+            if max(image.getpixel((x, y))) < 200
+        )
+
+    assert dark_pixels(picture(tmp_path, red_box(), line_color="black")) > 0
+    assert dark_pixels(picture(tmp_path, red_box())) == 0
+
+
+def test_export_png_assemblies(tmp_path):
+    """Each part is drawn at its place in the assembly, the assembly the
+    exported part belongs to doesn't move it, and empty parts are skipped"""
+    box = red_box()
+    assembly = Compound(children=[box])
+    assembly.location = Location((50, 0, 0), (0, 0, 45))
+    alone = red_box().moved(assembly.location)
+    view = {"viewpoint": (60, -20, 10), "look_at": (50, 0, 0)}
+    assert picture(tmp_path, assembly, **view) == picture(tmp_path, alone, **view)
+    assert picture(tmp_path, box) == picture(tmp_path, red_box())
+
+    with_empty_part = Compound(children=[red_box(), Compound()])
+    assert picture(tmp_path, with_empty_part) == picture(tmp_path, red_box())
+
+
+def test_export_png_default_view(tmp_path):
+    """Without a view, the whole shape is in the picture, in its middle, and the
+    margin keeps it off the border"""
+    image = picture(
+        tmp_path, red_box(), viewpoint=None, look_at=None, size=(120, 90), margin=3
+    )
+    width, height = image.size
+    drawn = [
+        (x, y)
+        for x in range(width)
+        for y in range(height)
+        if min(image.getpixel((x, y))) < 243
+    ]
+    columns, rows = [x for x, _ in drawn], [y for _, y in drawn]
+    assert min(columns) > 0 and min(rows) > 0
+    assert abs(min(columns) - (width - 1 - max(columns))) <= 1
+    assert abs(min(rows) - (height - 1 - max(rows))) <= 1
+
+
+def test_export_png_scale(tmp_path):
+    """At a scale, the picture is ExportSVG's page at dpi: a 10 mm cube seen from
+    the front at 254 dpi, 10 pixels a millimetre, takes 100 pixels, plus 0.9 for
+    half the 0.09 mm line on each side, plus the margin, which isn't scaled"""
+    path = tmp_path / "cube.png"
+    for scale, margin, expected in ((1, 0, 101), (2, 0, 201), (1, 1, 121)):
+        export_png(
+            Box(10, 10, 10), path, (0, -100, 0), scale=scale, margin=margin, dpi=254
+        )
+        with Image.open(path) as image:
+            assert image.size == (expected, expected)
+            assert image.info["dpi"] == pytest.approx((254, 254), abs=0.01)
+
+
+@pytest.mark.parametrize(
+    "viewpoint, up",
+    [((100, -80, 60), (0, 0, 1)), ((0, 0, 100), (1, 0, 0))],
+    ids=["wide", "tall"],
+)
+def test_export_png_matches_svg(tmp_path, viewpoint, up):
+    """Given ExportSVG's arguments, the picture is the SVG's page drawn at dpi:
+    the same size on paper, with drawing_view's lines on the picture's edges,
+    the default look_at included"""
+    base = Box(30, 20, 5)
+    base.color = Color("steelblue")
+    block = Pos(5, 3, 7.5) * Box(10, 8, 10)
+    block.color = Color("orange")
+    assembly = Compound(children=[base, block])
+    scale, margin, dpi = 2, 3, 200
+
+    visible, _hidden = assembly.drawing_view(viewpoint, up)
+    drawing = ExportSVG(scale=scale, margin=margin)
+    drawing.add_shape(visible)
+    drawing.write(tmp_path / "view.svg")
+    page = ET.parse(tmp_path / "view.svg").getroot().attrib
+    width, height = (
+        float(page[side].removesuffix("mm")) for side in ("width", "height")
+    )
+    left, top = (float(value) for value in page["viewBox"].split()[:2])
+
+    path = tmp_path / "view.png"
+    assert export_png(
+        assembly, path, viewpoint, up, scale=scale, margin=margin, dpi=dpi
+    )
+    with Image.open(path) as image:
+        assert 0 <= image.width - width / 25.4 * dpi < 1
+        assert 0 <= image.height - height / 25.4 * dpi < 1
+        lines = image.convert("L")
+    assert export_png(
+        assembly,
+        path,
+        viewpoint,
+        up,
+        scale=scale,
+        margin=margin,
+        dpi=dpi,
+        line_color=None,
+    )
+    with Image.open(path) as image:
+        faces = image.convert("L")
+
+    def on_an_edge(x: float, y: float) -> bool:
+        # The lines darken a pixel next to the point: a hairline between two
+        # pixels shares its black between them, and a dark face is no line
+        near = [
+            (round(x) + dx, round(y) + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+        ]
+        return any(lines.getpixel(n) < 0.9 * faces.getpixel(n) for n in near)
+
+    pixels = scale * dpi / 25.4
+    points = [edge.position_at(i / 20) for edge in visible for i in range(21)]
+    on_edges = [
+        on_an_edge((p.X - left) * pixels, (-p.Y - top) * pixels) for p in points
+    ]
+    assert sum(on_edges) / len(on_edges) > 0.95
+
+
+def test_export_png_errors(tmp_path):
+    """The errors users see for impossible views, sizes and shapes, and for a
+    folder that doesn't exist"""
+    path = tmp_path / "box.png"
+    with pytest.raises(ValueError, match="different points"):
+        export_png(red_box(), path, viewpoint=(1, 2, 3), look_at=(1, 2, 3))
+    with pytest.raises(ValueError, match="parallel"):
+        export_png(red_box(), path, viewpoint=(0, 0, 10), up=(0, 0, 1))
+    with pytest.raises(ValueError, match="one pixel"):
+        export_png(red_box(), path, size=(0, 10))
+    with pytest.raises(ValueError, match="positive"):
+        export_png(red_box(), path, scale=0)
+    with pytest.raises(ValueError, match="positive"):
+        export_png(red_box(), path, dpi=-96)
+    with pytest.raises(ValueError, match="margin"):
+        export_png(red_box(), path, size=(20, 20), margin=10)
+    with pytest.raises(ValueError, match="nothing to export"):
+        export_png(Compound(), path)
+    with pytest.raises(FileNotFoundError, match="missing"):
+        export_png(red_box(), tmp_path / "missing" / "box.png")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Only Linux needs an X server")
+def test_export_png_without_display(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISPLAY", ":12345")
+    with pytest.raises(RuntimeError, match="xvfb-run"):
+        export_png(Box(1, 1, 1), tmp_path / "box.png")
 
 
 class TestTessellateWithUVs(DirectApiTestCase):

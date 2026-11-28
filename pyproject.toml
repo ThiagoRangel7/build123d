@@ -75,6 +75,7 @@ development = [
     "covdefaults",
     "diff-cover",
     "mypy",
+    "pillow",
     "pylint",
     "pytest >= 9.1.1, < 9.2", # adjust upon resolution of ionelmc/pytest-benchmark/issues/321
     "pytest-benchmark",
